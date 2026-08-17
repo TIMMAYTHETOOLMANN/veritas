@@ -194,10 +194,15 @@ class Walker:
         end = start_block + count - 1
         if resume_from_state:
             cur, done, status = state.resume(self.chain_id)
-            if cur and status == "ok":
+            # "done" must resume too: a completed checkpoint means the
+            # prior range is already swept — re-running with --resume must
+            # pick up at cur+1 (no-op if the range is unchanged), never
+            # re-sweep from --start.
+            if cur and status in ("ok", "done"):
                 start_block = max(start_block, cur + 1)
                 print(f"[resume] chain {self.chain_id} from checkpoint "
-                      f"block {cur} ({done} processed) -> starting at {start_block}")
+                      f"block {cur} ({done} processed, {status}) "
+                      f"-> starting at {start_block}")
         chunk = chunk or config.blocks_per_page
         checkpoint_every = checkpoint_every or chunk
         agg = {}
