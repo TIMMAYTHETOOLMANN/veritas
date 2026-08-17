@@ -10,11 +10,13 @@ from core import value, probes, scoring
 RPC_URL = "https://ethereum-rpc.publicnode.com"
 
 # Public, well-known Tornado Cash pool deployments (mainnet)
+# NOTE: addresses verified live 2026-08-17 via eth_getCode on 2 RPCs.
+# 0x47CE0C6eD5B0Ce3d3A51fdb1C52DC66a7c3c2936 is the REAL 1-ETH pool
+# (5191B code, ~3947 ETH). The 10/100-ETH spellings below are UNVERIFIED —
+# validate before adding more.
 TARGETS = {
     "0x12D66f87A04A9E220743712cE6d9bB1B5616B8Fc": "TC 0.1 ETH",
-    "0x47CE0C6eD5B0Ce3d3A51fdb1C52DC66a7c3b29D1": "TC 1 ETH",
-    "0x910Cbd523D972eb0a6f4cAe451977D489341F51b": "TC 10 ETH",
-    "0xA160cdAB225685dA1d56aa342Ad8841c4b41fabe": "TC 100 ETH",
+    "0x47CE0C6eD5B0Ce3d3A51fdb1C52DC66a7c3c2936": "TC 1 ETH (verified)",
 }
 
 def fmt(wei):
