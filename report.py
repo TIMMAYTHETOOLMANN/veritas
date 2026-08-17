@@ -39,19 +39,40 @@ def connect_ro(path):
         # We still issue zero writes; flag it honestly.
         print(f"[report] WARN read-only URI open failed ({e}); using plain handle (no writes issued)",
               file=sys.stderr)
-        c = sqlite3.connect(p)
-        c.row_factory = sqlite3.Row
-        return c, False
+        try:
+            c = sqlite3.connect(p)
+            c.row_factory = sqlite3.Row
+            c.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()  # force open
+            return c, False
+        except sqlite3.Error as e2:
+            sys.exit(f"[report] cannot open DB {p}: {e2}")
 
 
 # ---- formatting helpers ----------------------------------------------------
 
 def trunc(s, limit=EVIDENCE_LIMIT):
-    """Truncate huge strings (evidence, results) to `limit` chars."""
+    """Truncate huge strings (evidence, results) to `limit` chars.
+
+    The '...(+N chars)' suffix is budgeted INSIDE `limit`: the returned
+    string (suffix included) is never longer than `limit`, so fixed-width
+    table cells cannot bleed into neighbouring columns. Widths too
+    narrow to fit a readable suffix (< 24) get a plain cut instead.
+    """
     if s is None:
         return ""
     s = str(s)
-    return s if len(s) <= limit else s[:limit] + f"...(+{len(s) - limit} chars)"
+    if len(s) <= limit:
+        return s
+    if limit < 24:
+        # Too narrow to budget a suffix — plain cut, exactly `limit` chars.
+        return s[:limit]
+    keep = limit - 12  # assume a 12-char suffix first, then rebalance
+    while keep > 0:
+        suffix = f"...(+{len(s) - keep} chars)"
+        if len(s[:keep]) + len(suffix) <= limit:
+            return s[:keep] + suffix
+        keep -= 1
+    return s[:limit]  # unreachable for limit >= 24, kept as a guard
 
 
 def eth(wei):
@@ -297,7 +318,8 @@ def render_console(d):
 # ---- single-target deep report ------------------------------------------------
 
 def render_target(c, addr):
-    addr = addr.strip()
+    # DB stores lowercase addresses (post-7694322); accept checksummed/mixed input.
+    addr = addr.strip().lower()
     t = c.execute("SELECT * FROM targets WHERE address = ?", (addr,)).fetchone()
     print(f"VERITAS TARGET DEEP REPORT — {addr}")
     print(line("="))
@@ -393,6 +415,8 @@ def main():
                   f"{sum(d['header']['findings_by_status'].values())} findings)")
         else:
             render_console(d)
+    except sqlite3.Error as e:
+        sys.exit(f"[report] query failed on {os.path.abspath(args.db)}: {e}")
     finally:
         c.close()
 
