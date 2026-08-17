@@ -23,6 +23,13 @@ CREATE TABLE IF NOT EXISTS probes(
 CREATE TABLE IF NOT EXISTS lineage(
   template_id TEXT, address TEXT, delta_regions TEXT,
   PRIMARY KEY(template_id, address));
+CREATE TABLE IF NOT EXISTS walker_state(
+  chain_id INTEGER PRIMARY KEY, cur_block INTEGER,
+  processed_count INTEGER, status TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS emitters(
+  chain_id INTEGER, address TEXT, deposits INTEGER, withdrawals INTEGER,
+  first_block INTEGER, last_block INTEGER, ts INTEGER,
+  PRIMARY KEY(chain_id, address));
 """
 
 def conn():

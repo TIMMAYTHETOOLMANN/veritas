@@ -1,240 +1,288 @@
-# core/walker.py — event-graph walker, fingerprint, dedup (integrity-first)
-import hashlib, time, json, traceback
-from core.db import conn, now, put
+# core/walker.py — event-graph sweep walker with fleet rotation, checkpoint/resume
+# Sweeps eth_getLogs for full 32-byte Deposit/Withdrawal topics, aggregates
+# emitter addresses (discovery.py-style), checkpoints every chunk via state.py.
+import time
+from core import db
 from core.config import config
-from core.cache import cache
 from core.state import state
-from core.selectors import scan_code, match_template, selectors_map
-from core.value import uint
-from core import rpc as rpc_mod
 
-# --- minimal RPC client with backoff + fleet rotation ---
+
+# Error text that means "this endpoint refuses unauthenticated traffic":
+# retrying it is pointless — it must leave the rotation for the whole run.
+AUTH_ERROR_MARKERS = ("unauthorized", "api key", "apikey", "authenticate")
+
+
+def _is_auth_error(exc):
+    """True if an RPC error smells like a key wall / auth refusal."""
+    msg = str(exc).lower()
+    return any(m in msg for m in AUTH_ERROR_MARKERS)
+
+
+class AllEndpointsDead(RuntimeError):
+    """Every endpoint in the fleet was marked dead — abort, never skip."""
+
+
 class WalkerRPC:
-    def __init__(self):
-        self.queue = list(config.rpc_endpoints)
-        self._rotate()
-    def _rotate(self):
-        self.client = rpc_mod.RPC(self.queue[0],
-                                   timeout=20, retries=config.max_retries)
-    def next(self):
-        self.queue.append(self.queue.pop(0))
-        self._rotate()
-    def eth_call(self, *a, **k):
-        try:
-            return self.client.eth_call(*a, **k)
-        except Exception as e:
-            self.next()
-            raise
+    """JSON-RPC client with retry + same-chain endpoint fleet rotation.
 
-# --- Walker class ---
+    Hardened auth policy: an endpoint whose error message contains
+    'Unauthorized' / 'API key' / 'authenticate' is marked DEAD for the
+    rest of the run and removed from rotation immediately. It never
+    burns retries again and can never cause a window skip. When the
+    last live endpoint dies, AllEndpointsDead aborts the sweep (the
+    checkpoint stays intact) instead of silently skipping windows."""
+
+    def __init__(self, chain_id, rpc_url=None, fleet=None):
+        from core.rpc import RPC
+        self.fleet = list(fleet or config.rpc_fleet.get(chain_id) or [rpc_url])
+        if rpc_url and rpc_url not in self.fleet:
+            self.fleet.insert(0, rpc_url)
+        self.idx = 0
+        self.dead = 0
+        self.rotations = 0
+        self._spun = 0
+        self.client = RPC(self.fleet[0], timeout=config.rpc_timeout,
+                          retries=config.max_retries)
+
+    def rotate(self):
+        self.idx = (self.idx + 1) % len(self.fleet)
+        self.rotations += 1
+        from core.rpc import RPC
+        self.client = RPC(self.fleet[self.idx], timeout=config.rpc_timeout,
+                          retries=config.max_retries)
+
+    def _mark_dead(self, reason):
+        """Remove the current endpoint from the fleet for the rest of the
+        run and point the client at the next live one. Raises
+        AllEndpointsDead if nothing live remains."""
+        url = self.fleet.pop(self.idx)
+        self.dead += 1
+        print(f"[rpc] endpoint DEAD for this run ({reason}): {url} | "
+              f"{len(self.fleet)} live remaining", flush=True)
+        if not self.fleet:
+            raise AllEndpointsDead(
+                f"all RPC endpoints for this chain are dead "
+                f"(last reason: {reason}) — aborting sweep; checkpoint "
+                f"is preserved, fix the fleet in core/config.py")
+        self.idx = self.idx % len(self.fleet)
+        from core.rpc import RPC
+        self.client = RPC(self.fleet[self.idx], timeout=config.rpc_timeout,
+                          retries=config.max_retries)
+
+    def call(self, method, params):
+        """Call with rotation. A non-auth failure gets max_retries on one
+        endpoint (inside RPC), then rotates; after every live endpoint
+        has failed once, raise. An auth failure marks the endpoint dead
+        for the run and immediately retries on the next live one."""
+        last = None
+        self._spun = 0
+        while self.fleet:
+            try:
+                out = self.client.call(method, params)
+                self._spun = 0
+                return out
+            except Exception as e:
+                last = e
+                self._spun += 1
+                if _is_auth_error(e):
+                    self._spun = 0           # fresh budget on smaller fleet
+                    self._mark_dead(str(e))  # raises AllEndpointsDead if empty
+                elif self._spun >= len(self.fleet):
+                    raise last
+                else:
+                    self.rotate()
+        raise last
+
+    def block_number(self):
+        return int(self.call("eth_blockNumber", []), 16)
+
+    def eth_call(self, *a, **k):
+        return self.client.eth_call(*a, **k)
+
+
+def _fmt_agg(agg):
+    """Aggregate dict -> compact display string."""
+    deps = sum(v["deposits"] for v in agg.values())
+    wds = sum(v["withdrawals"] for v in agg.values())
+    return f"{len(agg)} emitters / {deps} deposits / {wds} withdrawals"
+
+
+def merge_agg(dst, add):
+    """Merge aggregate {addr: {deposits,withdrawals,first_block,last_block}}."""
+    for addr, e in add.items():
+        d = dst.setdefault(addr, {"deposits": 0, "withdrawals": 0,
+                                  "first_block": e["first_block"],
+                                  "last_block": e["last_block"]})
+        d["deposits"] += e["deposits"]
+        d["withdrawals"] += e["withdrawals"]
+        d["first_block"] = min(d["first_block"], e["first_block"])
+        d["last_block"] = max(d["last_block"], e["last_block"])
+    return dst
+
+
 class Walker:
-    def __init__(self, chain_id, chain_name, rpc_url, event_topics, start_block):
+    """Chunked eth_getLogs sweep with adaptive range, checkpoint, progress."""
+
+    def __init__(self, chain_id, chain_name, rpc_url=None, fleet=None):
         self.chain_id = chain_id
         self.chain_name = chain_name
-        self.rpc_url = rpc_url
-        self.event_topics = event_topics
-        self.start_block = start_block
-        self.client = rpc_mod.RPC(rpc_url, timeout=20, retries=config.max_retries)
-        self.sm = selectors_map()
-        self.stats = {"candidates": 0, "scanned": 0, "skipped": 0, "errors": 0,
-                      "bytecode_fetches": 0, "deduped": 0}
+        self.rpc = WalkerRPC(chain_id, rpc_url=rpc_url, fleet=fleet)
+        from core.config import EVENT_TOPICS
+        self.event_topics = dict(EVENT_TOPICS)
+        self.stats = {"chunks": 0, "retries": 0, "logs": 0,
+                      "skipped_windows": 0, "endpoints_rotated": 0}
 
-    def _format_log_topic(self, topic_hex):
-        return "0x" + topic_hex[2:].lower()
+    # -- one getLogs chunk for one topic, adaptive retry via WalkerRPC -----
+    def fetch_chunk(self, topic, lo, hi):
+        return self.rpc.call("eth_getLogs", [{
+            "fromBlock": hex(lo), "toBlock": hex(hi),
+            "topics": [topic],
+        }])
 
-    def scan_cursor(self, from_block, to_block):
-        """Scan logs for event signatures in [from_block, to_block], yield unique contract addresses."""
-        seen = set()
-        for topic_key, sel_hex in self.event_topics.items():
-            topic = self._format_log_topic(sel_hex)
-            try:
-                logs = self.client.call("eth_getLogs", [
-                    {"fromBlock": hex(from_block), "toBlock": hex(to_block),
-                     "topics": [topic], "address": ""}
-                ])
-            except Exception:
-                self.stats["errors"] += 1
-                continue
-            if not logs:
-                continue
-            for log in logs:
-                addr = log.get("address", "")
-                if not addr or addr in seen:
-                    continue
-                seen.add(addr)
-                yield addr
-        self.stats["scanned"] += 1
+    def scan_chunk(self, lo, hi):
+        """Scan [lo, hi] for all topics. Returns aggregate dict for the chunk."""
+        agg = {}
+        for name, topic in self.event_topics.items():
+            logs = self.fetch_chunk(topic, lo, hi)
+            self.stats["logs"] += len(logs)
+            for lg in logs:
+                a = lg["address"].lower()
+                b = int(lg["blockNumber"], 16)
+                e = agg.setdefault(a, {"deposits": 0, "withdrawals": 0,
+                                       "first_block": b, "last_block": b})
+                if name == "Deposit":
+                    e["deposits"] += 1
+                else:
+                    e["withdrawals"] += 1
+                e["first_block"] = min(e["first_block"], b)
+                e["last_block"] = max(e["last_block"], b)
+        return agg
 
-    def analyze_address(self, addr):
-        """Fingerprint an address: bytecode, select
-
-ors present, template sim. Return normalized candidate dict or None."""
-        # skip zero/non-contract code
-        code = self.client.get_code(addr)
-        if not code or code in ("0x", "0x0"):
-            self.stats["skipped"] += 1
-            return None
-        bc_len = len(code) - 2 if isinstance(code, str) else len(code)
-        if bc_len < config.min_bytecode_size:
-            self.stats["skipped"] += 1
-            return None
-        # deduplicate on bytecode hash
-        bc_hash = hashlib.sha256(code.encode() if isinstance(code, str) else code).hexdigest()
-        c = conn()
-        dup = c.execute("SELECT COUNT(*) FROM targets WHERE bc_hash=?", (bc_hash,)).fetchone()[0]
-        if dup > 0:
-            self.stats["deduped"] += 1
+    def persist_emitters(self, agg):
+        c = db.conn()
+        try:
+            for addr, e in agg.items():
+                row = c.execute(
+                    "SELECT deposits, withdrawals, first_block, last_block "
+                    "FROM emitters WHERE chain_id=? AND address=?",
+                    (self.chain_id, addr)).fetchone()
+                if row:
+                    e = {"deposits": row["deposits"] + e["deposits"],
+                         "withdrawals": row["withdrawals"] + e["withdrawals"],
+                         "first_block": min(row["first_block"], e["first_block"]),
+                         "last_block": max(row["last_block"], e["last_block"])}
+                c.execute(
+                    "INSERT OR REPLACE INTO emitters"
+                    "(chain_id,address,deposits,withdrawals,first_block,last_block,ts) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (self.chain_id, addr, e["deposits"], e["withdrawals"],
+                     e["first_block"], e["last_block"], db.now()))
+            c.commit()
+        finally:
             c.close()
-            return None
-        c.close()
-        # fingerprint
-        present = scan_code(code)
-        tid, sim = match_template(present)
-        if sim < config.template_sim_floor:
-            self.stats["skipped"] += 1
-            return None
-        # config reads (denom, root, levels)
-        denom = uint(self.client.eth_call(addr, self.sm["denom"]))
-        root = self.client.eth_call(addr, self.sm["getroot"])
-        levels = uint(self.client.eth_call(addr, self.sm["levels"]))
-        return {
-            "address": addr,
-            "chain_id": self.chain_id,
-            "chain_name": self.chain_name,
-            "code_size": bc_len,
-            "bytecode_hash": bc_hash,
-            "template_id": tid,
-            "similarity": round(sim, 3),
-            "denom": str(denom) if denom else None,
-            "root": str(root)[:32] if root else None,
-            "levels": levels,
-            "deposit_sel": present["deposit"],
-            "withdraw_sel": present["withdraw"],
-            "nullif_sel": present["nullif"],
-            "setver_sel": present["setver"],
-            "ts": now(),
-            "status": "candidate",
-        }
 
-    def run(self, from_block=None, to_block=None):
-        """Walk [from_block, to_block], persist candidates, return count."""
-        cur = from_block if from_block is not None else self.start_block
-        end = to_block if to_block is not None else cur + config.blocks_per_page
-        c = conn()
-        processed_count = 0
-        for addr in self.scan_cursor(cur, end):
-            cand = self.analyze_address(addr)
-            if cand is None:
+    def run(self, start_block, count, chunk=None, checkpoint_every=None,
+            resume_from_state=False, progress_every=30.0, on_chunk=None):
+        """Sweep [start_block, start_block + count - 1].
+
+        checkpoint_every: persist a walker_state checkpoint every N blocks
+        (defaults to the chunk size — one checkpoint per chunk).
+        resume_from_state: continue from the last checkpoint instead of
+        start_block (start_block then acts as the floor).
+        Returns (agg, meta) where meta has block-range and stats.
+        """
+        end = start_block + count - 1
+        if resume_from_state:
+            cur, done, status = state.resume(self.chain_id)
+            if cur and status == "ok":
+                start_block = max(start_block, cur + 1)
+                print(f"[resume] chain {self.chain_id} from checkpoint "
+                      f"block {cur} ({done} processed) -> starting at {start_block}")
+        chunk = chunk or config.blocks_per_page
+        checkpoint_every = checkpoint_every or chunk
+        agg = {}
+        lo = start_block
+        last_ckpt = start_block - 1
+        t0 = time.time()
+        t_last = t0
+        processed = 0
+
+        while lo <= end:
+            hi = min(lo + chunk - 1, end)
+            try:
+                chunk_agg = self.scan_chunk(lo, hi)
+            except AllEndpointsDead:
+                # Fleet is exhausted (e.g. every endpoint key-walled):
+                # persist the checkpoint + what we have, then ABORT.
+                # A dead fleet must never be punished with chunk halving
+                # or window skips — that is silent data loss.
+                state.checkpoint(self.chain_id, lo - 1, processed)
+                self.persist_emitters(agg)
+                self.stats["endpoints_rotated"] = self.rpc.rotations
+                self.stats["endpoints_dead"] = self.rpc.dead
+                raise
+            except Exception as e:
+                if chunk > config.min_chunk_blocks:
+                    chunk = max(config.min_chunk_blocks, chunk // 2)
+                    self.stats["retries"] += 1
+                    continue
+                # floor chunk unrecoverable — record skip, advance
+                self.stats["skipped_windows"] += 1
+                print(f"[warn] skipping unrecoverable window "
+                      f"[{lo}..{hi}] after error: {e}")
+                lo = hi + 1
                 continue
-            # persist
-            put(c, "INSERT OR REPLACE INTO targets VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (cand["address"], cand["chain_name"], cand["code_size"],
-                 cur, cand["template_id"], cand["similarity"],
-                 cand["denom"], cand["root"], cand["levels"],
-                 cand["deposit_sel"], cand["withdraw_sel"],
-                 cand["nullif_sel"], cand["setver_sel"],
-                 cand["bytecode_hash"], cand["ts"], cand["status"]))
-            put(c, "INSERT OR REPLACE INTO walker_state(chain_id,cur_block,processed_count,status,ts) "
-                 "VALUES(?,?,?,?,?)",
-                 (self.chain_id, cur, processed_count, "ok", now()))
-            self.stats["candidates"] += 1
-            processed_count += 1
-            if self.stats["candidates"] >= config.max_candidates_per_chain:
-                break
-        c.close()
-        state.checkpoint(self.chain_id, cur, processed_count)
-        return processed_count
-
-# --- Event index walker -> pull deposit/withdrawal/nullifier events from chain ---
-def event_index_walk(rpc, chain_id, start_from, topics, max_pages=None):
-    """Paginated log fetch. Yields (address, event_key, block). For active chain scanning."""
-    page = 0
-    cursor = start_from
-    while max_pages is None or page < max_pages:
-        page += 1
-        try:
-            logs = rpc.call("eth_getLogs", [
-                {"fromBlock": hex(cursor), "toBlock": hex(cursor + config.blocks_per_page - 1),
-                 "topics": [], "address": ""}
-            ])
-        except Exception:
-            yield None, None, None
-            page -= 1  # retry on failure
-            continue
-        if not logs:
-            cursor += config.blocks_per_page
-            continue
-        for log in logs:
-            addr = log.get("address", "")
-            if not addr:
+            if len(chunk_agg) >= config.log_cap and chunk > config.min_chunk_blocks:
+                # response likely truncated — refetch narrower
+                chunk = max(config.min_chunk_blocks, chunk // 2)
+                self.stats["retries"] += 1
                 continue
-            topics_log = log.get("topics", [])
-            for key, sel in topics.items():
-                if topics[topic_key] in topics_log:  # matching topic present
-                    yield addr, key, log.get("blockNumber")
-        cursor += config.blocks_per_page
-    return
 
-# --- Harness ---
-def walk_chain(chain_id, chain_name, rpc_url, event_topics, start_block=0, end_block=None):
-    """Run walker on one chain. Returns count of candidates found."""
-    w = Walker(chain_id, chain_name, rpc_url, event_topics, start_block)
-    return w.run(from_block=start_block, to_block=end_block)
+            merge_agg(agg, chunk_agg)
+            self.stats["chunks"] += 1
+            processed += (hi - lo + 1)
+            lo = hi + 1
+            chunk = min(config.blocks_per_page, int(chunk * 1.25) + 1)
 
-def walk_all(chains=None):
-    """Walk all configured chains, return totals."""
-    if chains is None:
-        chains = config.chains
-    totals = {}
-    for cid, name, url, topics, start in chains:
-        try:
-            n = walk_chain(cid, name, url, topics, start)
-            totals[name] = n
-        except Exception:
-            totals[name] = 0
-            traceback.print_exc()
-    return totals
+            if hi - last_ckpt >= checkpoint_every or lo > end:
+                state.checkpoint(self.chain_id, hi, processed)
+                self.persist_emitters(chunk_agg)
+                last_ckpt = hi
+            if on_chunk:
+                on_chunk(lo - 1, chunk, chunk_agg)
 
-def report():
-    """Read candidate pool from DB and return summary."""
-    c = conn()
-    rows = c.execute("""
-        SELECT address, chain, template_id, similarity, denom, code_size,
-               deposit_sel, withdraw_sel, nullif_sel, setver_sel
-        FROM targets WHERE status='candidate' ORDER BY similarity DESC
-    """).fetchall()
-    c.close()
-    return [dict(r) for r in rows]
+            now = time.time()
+            if now - t_last >= progress_every or lo > end:
+                pct = 100.0 * (lo - start_block) / max(1, end - start_block + 1)
+                print(f"[walk] {self.chain_name} block {lo-1} "
+                      f"({pct:.1f}%) chunk={chunk} logs={self.stats['logs']} "
+                      f"| {_fmt_agg(agg)} | {now - t0:.1f}s", flush=True)
+                t_last = now
 
-def main():
-    """CLI: walk configured chains, print candidates."""
-    print("[walker] initializing fortified walker...")
-    c = conn()
-    # self-create schema — idempotent, survives old validate.py DB
-    c.executescript("""
-        DROP TABLE IF EXISTS targets;
-        DROP TABLE IF EXISTS walker_state;
-        CREATE TABLE IF NOT EXISTS targets(
-            address TEXT PRIMARY KEY, chain TEXT, code_size INTEGER, cur_block INTEGER,
-            template_id TEXT, similarity REAL, denom TEXT, root TEXT,
-            levels INTEGER, deposit_sel TEXT, withdraw_sel TEXT,
-            nullif_sel TEXT, setver_sel TEXT, bytecode_hash TEXT,
-            ts INTEGER, status TEXT);
-        CREATE TABLE IF NOT EXISTS walker_state(
-            chain_id INTEGER PRIMARY KEY, cur_block INTEGER,
-            processed_count INTEGER, status TEXT, ts INTEGER);
-    """)
-    c.commit()
-    c.close()
-    totals = walk_all()
-    print(f"[walker] done: {totals}")
-    pool = report()
-    print(f"[walker] candidates: {len(pool)}")
-    for p in pool[:5]:
-        print(f"  {p['address'][:10]}... {p['chain']} sim={p['similarity']} "
-              f"template={p['template_id']} denom={p['denom']}")
-    if len(pool) > 5:
-        print(f"  ... +{len(pool)-5} more")
+        state.checkpoint(self.chain_id, end, processed, status="done")
+        self.stats["endpoints_rotated"] = self.rpc.rotations
+        self.stats["endpoints_dead"] = self.rpc.dead
+        return agg, {"from": start_block, "to": end, "stats": dict(self.stats),
+                     "seconds": round(time.time() - t0, 1)}
+
+
+def chain_by(key):
+    """Resolve chain config by name or chain id."""
+    k = str(key).lower()
+    for cid, name, url, topics, start in config.chains:
+        if k in (name, str(cid)):
+            return (cid, name, url, topics, start)
+    raise SystemExit(f"[error] unknown chain '{key}' "
+                     f"(known: {[c[1] for c in config.chains]})")
+
+
+def walk_chain(key, start_block, count, chunk=None, resume=False, fleet=None):
+    """Sweep one configured chain over [start_block, start_block+count)."""
+    cid, name, url, topics, start = chain_by(key)
+    db.init()
+    w = Walker(cid, name, rpc_url=url, fleet=fleet)
+    return w.run(start_block, count, chunk=chunk, resume_from_state=resume)
+
 
 if __name__ == "__main__":
-    main()
+    print("library module — run walker.py (repo root) for the CLI")
