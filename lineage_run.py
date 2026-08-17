@@ -6,7 +6,13 @@
 #   python lineage_run.py --cluster   # cluster live targets, print + persist to lineage table
 #   python lineage_run.py --delta REF FORK   # delta_regions as byte ranges w/ % of code length
 #   python lineage_run.py --selftest  # synthetic validation of similarity() + delta_regions()
-import argparse, json, os, sys
+#
+# CASE POLICY: scan.py and eth_getLogs/eth_getCode emit LOWERCASE addresses, while
+# SEED_POOLS/REFERENCE are CHECKSUMMED and SQLite TEXT PKs are case-sensitive.
+# To keep every join/lookup consistent, addresses are normalized to lowercase at
+# every boundary: manifest keys, targets reads/writes, lineage writes, reference
+# lookups, and --delta args. Checksummed display is preserved only in labels.
+import argparse, json, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core import db, lineage
@@ -16,7 +22,8 @@ from core.config import config
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(ROOT, "cache", "lineage_codes.json")
 RPC_URL = config.rpc_endpoints[0]  # https://ethereum-rpc.publicnode.com (free/public, read-only)
-REFERENCE = "0x12D66f87A04A9E220743712cE6d9bB1B5616B8Fc"  # TC 0.1 ETH pool
+REFERENCE = "0x12D66f87A04A9E220743712cE6d9bB1B5616B8Fc"  # TC 0.1 ETH pool (checksummed source of truth)
+REF = REFERENCE.lower()                                   # canonical lowercase key
 
 # Reference-scan set (mirrors validate.py known TC pools; phantoms are verified 0B via RPC in --seed)
 SEED_POOLS = {
@@ -30,17 +37,71 @@ SEED_PHANTOMS = [
 ]
 
 
+def norm(a):
+    """Normalize any address to the canonical lowercase form used as the key
+    everywhere: manifest, targets, lineage, lookups."""
+    return a.strip().lower()
+
+
+def migrate_db_lowercase():
+    """One-time idempotent migration: fold any mixed/upper-case address rows in
+    targets and lineage down to lowercase so joins against scan.py data (which
+    emits lowercase) can never miss. INSERT OR REPLACE lower + DELETE upper."""
+    db.init()
+    c = db.conn()
+    changed = 0
+    for table, cols in (("targets", ["address"]),
+                        ("lineage", ["template_id", "address"])):
+        where = " OR ".join(f"{col} != lower({col})" for col in cols)
+        rows = c.execute(f"SELECT * FROM {table} WHERE {where}").fetchall()
+        for row in rows:
+            r = dict(row)
+            for col in cols:
+                r[col] = r[col].lower()
+            names = ", ".join(r.keys())
+            ph = ", ".join("?" for _ in r)
+            c.execute(f"INSERT OR REPLACE INTO {table}({names}) VALUES({ph})",
+                      tuple(r[k] for k in r.keys()))
+        if rows:
+            c.execute(f"DELETE FROM {table} WHERE {where}")
+        changed += len(rows)
+    c.commit()
+    c.close()
+    return changed
+
+
 def load_manifest():
     if os.path.exists(MANIFEST):
-        with open(MANIFEST) as f:
-            return json.load(f)
+        try:
+            with open(MANIFEST) as f:
+                raw = json.load(f)
+        except json.JSONDecodeError as e:
+            ts = int(time.time())
+            corrupt = f"{MANIFEST}.corrupt-{ts}"
+            os.replace(MANIFEST, corrupt)
+            print(f"[manifest] WARNING: {MANIFEST} is corrupt ({e}) — "
+                  f"moved to {corrupt}, starting with a fresh manifest", file=sys.stderr)
+            return {}
+        # re-key under lowercase; drop any dupe after folding (first value wins)
+        m = {}
+        for k, v in raw.items():
+            lk = norm(k)
+            if lk not in m:
+                m[lk] = v
+        return m
     return {}
 
 
 def save_manifest(m):
+    """Atomic write: temp file on the same volume, then os.replace. A crash
+    mid-write can never leave a half-written manifest behind."""
     os.makedirs(os.path.dirname(MANIFEST), exist_ok=True)
-    with open(MANIFEST, "w") as f:
+    tmp = MANIFEST + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(m, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, MANIFEST)
 
 
 def cmd_seed():
@@ -50,19 +111,21 @@ def cmd_seed():
     db.init()
     c = db.conn()
     for addr, label in SEED_POOLS.items():
-        code = rpc.get_code(addr)
+        a = norm(addr)
+        code = rpc.get_code(a)
         size = len(code) // 2 - 1 if code and code != "0x" else 0
         db.put(c, "INSERT OR REPLACE INTO targets VALUES(?,?,?,?,?,?,?)",
-               (addr, "ethereum", size, None, None, None, db.now()))
-        print(f"[seed] pool   {label:12s} {addr} code={size}B")
+               (a, "ethereum", size, None, None, None, db.now()))
+        print(f"[seed] pool   {label:12s} {a} code={size}B")
     for addr in SEED_PHANTOMS:
-        code = rpc.get_code(addr)
+        a = norm(addr)
+        code = rpc.get_code(a)
         if code not in ("0x", "", None):
-            print(f"[seed] SKIP phantom {addr} has code ({len(code)//2-1}B) — not a phantom")
+            print(f"[seed] SKIP phantom {a} has code ({len(code)//2-1}B) — not a phantom")
             continue
         db.put(c, "INSERT OR REPLACE INTO targets VALUES(?,?,?,?,?,?,?)",
-               (addr, "ethereum", 0, None, None, None, db.now()))
-        print(f"[seed] phantom {addr} code=0B (verified via eth_getCode)")
+               (a, "ethereum", 0, None, None, None, db.now()))
+        print(f"[seed] phantom {a} code=0B (verified via eth_getCode)")
     c.close()
 
 
@@ -70,7 +133,11 @@ def cmd_fetch():
     """Fetch bytecode for every targets address into the manifest cache.
     Idempotent: cached addresses are skipped (bytecode is immutable for
     non-proxy contracts). Zero-code phantoms are cached as '' and excluded
-    from clustering — fuzzy_hash('') is meaningless."""
+    from clustering — fuzzy_hash('') is meaningless.
+
+    Durability: the manifest is persisted every 10 fetches so an RPC failure
+    mid-run keeps all prior progress; a per-address RPC error is logged and
+    the run continues to the next address instead of aborting."""
     db.init()
     c = db.conn()
     addrs = [r["address"] for r in c.execute("SELECT address FROM targets ORDER BY address").fetchall()]
@@ -78,21 +145,35 @@ def cmd_fetch():
     if not addrs:
         sys.exit("[fetch] targets table is empty — run `python lineage_run.py --seed` first")
     manifest, rpc = load_manifest(), RPC(RPC_URL)
-    fetched = skipped = empty = 0
+    fetched = skipped = empty = failed = 0
+    since_save = 0
     for a in addrs:
+        a = norm(a)
         if a in manifest:
             skipped += 1
             print(f"[fetch] cached  {a} code={len(manifest[a])//2}B")
             continue
-        code = rpc.get_code(a)
+        try:
+            code = rpc.get_code(a)
+        except Exception as e:
+            failed += 1
+            print(f"[fetch] ERROR  {a} RPC failure: {e} — continuing to next address",
+                  file=sys.stderr)
+            continue
         if code in ("0x", "", None):
             manifest[a], empty = "", empty + 1
             print(f"[fetch] PHANTOM {a} code=0B (cached as empty; excluded from clustering)")
         else:
             manifest[a], fetched = code, fetched + 1
             print(f"[fetch] fetched {a} code={len(code)//2-1}B")
+        since_save += 1
+        if since_save >= 10:
+            save_manifest(manifest)
+            print(f"[fetch] checkpoint: manifest saved ({fetched} fetched so far)")
+            since_save = 0
     save_manifest(manifest)
-    print(f"[fetch] manifest={MANIFEST} fetched={fetched} cached_skip={skipped} phantom_empty={empty}")
+    print(f"[fetch] manifest={MANIFEST} fetched={fetched} cached_skip={skipped} "
+          f"phantom_empty={empty} failed={failed}")
 
 
 def cmd_cluster():
@@ -103,16 +184,16 @@ def cmd_cluster():
     phantoms = [a for a, h in manifest.items() if not h]
     for a in sorted(phantoms):
         print(f"[cluster] EXCLUDED phantom (0B code): {a}")
-    ref_hex = manifest.get(REFERENCE)
+    ref_hex = manifest.get(REF)
     if not ref_hex:
-        print(f"[cluster] reference {REFERENCE} not in manifest — clustering without vs_reference")
+        print(f"[cluster] reference {REF} not in manifest — clustering without vs_reference")
     out = lineage.cluster(live, reference_hex=ref_hex)
 
     # deterministic ordering: size desc, then lowest address
     clusters = sorted(out["clusters"], key=lambda ms: (-len(ms), min(ms)))
     def root_of(members):
-        if ref_hex and REFERENCE in members:
-            return REFERENCE
+        if ref_hex and REF in members:
+            return REF
         return max(members, key=lambda a: (len(manifest[a]), a))  # largest code = closest to template
 
     db.init()
@@ -124,7 +205,7 @@ def cmd_cluster():
         tid = f"cluster_{root}"
         print(f"\n  {tid} (cluster #{n})  root={root}  size={len(members)}")
         for a in members:
-            dr = lineage.delta_regions(ref_hex, manifest[a]) if ref_hex and a != REFERENCE else []
+            dr = lineage.delta_regions(ref_hex, manifest[a]) if ref_hex and a != REF else []
             pct = f" ({sum(e - s for s, e in dr) / max(1, len(manifest[a]) // 2) * 100:.2f}% of code)" if dr else ""
             db.put(c, "INSERT OR REPLACE INTO lineage VALUES(?,?,?)",
                    (tid, a, json.dumps(dr)))
@@ -138,6 +219,7 @@ def cmd_cluster():
 
 
 def cmd_delta(ref, fork):
+    ref, fork = norm(ref), norm(fork)
     manifest, rpc = load_manifest(), RPC(RPC_URL)
     def code_of(a):
         if a in manifest and manifest[a]:
@@ -167,7 +249,7 @@ def cmd_selftest():
     """Synthetic validation: flip 100 bytes of TC 0.1 code at a known offset,
     verify delta_regions() localizes within ±64B and similarity() stays >0.9."""
     manifest = load_manifest()
-    code = manifest.get(REFERENCE)
+    code = manifest.get(REF)
     if not code:
         sys.exit("[selftest] TC 0.1 bytecode not in manifest — run --fetch first")
     body = code[2:] if code.startswith("0x") else code
@@ -208,6 +290,7 @@ def main():
     p.add_argument("--selftest", action="store_true", help="synthetic similarity/delta validation")
     p.add_argument("--delta", nargs=2, metavar=("REF", "FORK"), help="delta regions REF vs FORK")
     a = p.parse_args()
+    migrate_db_lowercase()   # idempotent: no-op once DB rows are all lowercase
     if a.seed:
         cmd_seed()
     if a.fetch:
