@@ -66,7 +66,12 @@ def resolve_block(rpc, block_arg):
     block_arg = str(block_arg).strip()
     if block_arg.lower() in ("latest", "pending", "earliest", "safe", "finalized"):
         return block_arg.lower(), block_arg.lower()
-    n = int(block_arg)
+    try:
+        n = int(block_arg)
+    except ValueError:
+        raise ValueError(
+            f"invalid --block '{block_arg}': expected an integer block number "
+            f"or one of latest/pending/earliest/safe/finalized")
     return str(n), hex(n)  # eth_call accepts either; hex is unambiguous
 
 
@@ -204,7 +209,11 @@ def run_fork(address, block_arg, anvil_path=None):
         print("     VERITAS/tools/anvil.exe or %USERPROFILE%\\.foundry\\anvil.exe")
         return 1
 
-    label, blk = resolve_block(None, block_arg)
+    try:
+        label, blk = resolve_block(None, block_arg)
+    except ValueError as e:
+        print(f"[t3] fork rehearsal aborted: {e}")
+        return 2
     pinned = None if label in ("latest",) else int(label)
 
     # Retry ladder: all endpoints together first (anvil round-robins across
@@ -254,7 +263,10 @@ def main():
     ap.add_argument("--anvil-path", default=None, help="explicit path to anvil.exe")
     args = ap.parse_args()
 
-    address = args.target
+    # Canonical lowercase key — matches targets/report/lineage normalization
+    # (siblings do the same); probe rows previously stored the checksummed
+    # spelling, splitting the key space in the DB.
+    address = args.target.strip().lower()
     db.init()
     c = db.conn()
 
