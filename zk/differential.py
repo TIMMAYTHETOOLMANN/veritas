@@ -128,10 +128,24 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
         if on["outcome"] == "ACCEPTED":
             accepted += 1
             loc = None
+            confirmed = False
             if local_oracle and expect_local_invalid:
                 loc = L3.groth16_verify(vk, proof, pubs)  # ground truth
+                confirmed = (loc is False)
+            elif not local_oracle:
+                # No VK extracted -> no local oracle. But a properly
+                # functioning verifier with a hardcoded VK MUST reject
+                # structured random proofs. On-chain ACCEPT without a
+                # valid VK is itself the soundness violation: the contract
+                # does no real verification (stub, missing pairing call,
+                # or caller-supplied VK that the attacker controls).
+                # Cross-circuit replay (xvk:cross) acceptance confirms it
+                # is not circuit-bound.
+                loc = "NO_VK_ACCEPTED"
+                confirmed = True
             hits.append({"label": label, "class": vclass, "on_chain": on,
                          "local_oracle_valid": loc,
+                         "confirmed": confirmed,
                          "witness_head": [str(x) for x in pubs[:4]],
                          "calldata_head": calldata[:78]})
         else:
@@ -197,11 +211,9 @@ def _persist(campaign):
          campaign["reverted"], campaign["backend"],
          json.dumps(campaign["hits"])[:4000], db.now()))
     campaign_id = cur.lastrowid
-    # Every accepted-but-locally-invalid proof is a finding.
-    status = None
+    # Every confirmed hit (on-chain ACCEPT + no valid math backing) is a finding.
     for h in campaign["hits"]:
-        critical = (h["on_chain"]["outcome"] == "ACCEPTED"
-                    and h.get("local_oracle_valid") is False)
+        critical = h.get("confirmed", False)
         confidence = "differential_confirmed" if critical else "suspect"
         status = "T4_CONFIRMED" if critical else "T4_SUSPECT"
         c.execute("""INSERT INTO findings

@@ -91,6 +91,7 @@ def static_impact(address, confirmed=False, confirmed_classes=None,
             "address": address, "vclass": vclass,
             "V_wei": str(V), "ceiling": spec["ceiling"],
             "recipe": spec["recipe"],
+            "taxonomy": _taxonomy(vclass),
             "L0_wei": str(l0), "L1_wei": str(l1),
             "p_success": p_success, "competition": competition,
             "gas_wei": str(int(gas_wei)),
@@ -98,6 +99,24 @@ def static_impact(address, confirmed=False, confirmed_classes=None,
             "verdict": verdict,
         })
     return out
+
+
+# ----------------------------------------------------------------------------
+# Economic classification (described taxonomy: Infinite Mint / Double Spend /
+# Fund Drain). Maps a recipe-class to its money-path taxonomy. Derived purely
+# from the class, so it stays honest — never upgraded by assumption.
+# ----------------------------------------------------------------------------
+
+CLASS_TAXONOMY = {
+    "caller_supplied_vk": "FUND_DRAIN",
+    "zk_verifier_config_mismatch": "REPLAY_OR_DRAIN",
+    "zk_proof_malleability": "DOUBLE_SPEND",
+    "zk_nullifier_collision": "DOUBLE_SPEND",
+}
+
+
+def _taxonomy(vclass):
+    return CLASS_TAXONOMY.get(vclass, "UNCLASSIFIED")
 
 
 # ----------------------------------------------------------------------------
@@ -216,6 +235,7 @@ def persist_static(rows):
              r["p_success"], r["competition"], r["ev_wei"],
              json.dumps({"L0": r["L0_wei"], "L1": r["L1_wei"],
                          "gas_wei": r["gas_wei"],
+                         "taxonomy": r.get("taxonomy", "UNCLASSIFIED"),
                          "verdict": r["verdict"]})))
         c.execute("""INSERT OR REPLACE INTO impact_sims
             (finding_id, address, fork_block, pre_tvl_wei, post_tvl_wei,
@@ -231,12 +251,13 @@ def persist_static(rows):
 
 def report(rows, address):
     print(f"\n[t5] economic impact — {address}")
-    hdr = f"  {'CLASS':<30}{'V(ETH)':>14}{'EV(ETH)':>14}  VERDICT"
+    hdr = f"  {'CLASS':<30}{'V(ETH)':>12}{'EV(ETH)':>12}  {'TAXONOMY':<14}VERDICT"
     print(hdr)
     for r in rows:
         v_eth = int(r["V_wei"]) / 1e18
         ev_eth = int(r["ev_wei"]) / 1e18
-        print(f"  {r['vclass']:<30}{v_eth:>14,.4f}{ev_eth:>14,.4f}  {r['verdict']}")
+        print(f"  {r['vclass']:<30}{v_eth:>12,.4f}{ev_eth:>12,.4f}  "
+              f"{r.get('taxonomy','UNCLASSIFIED'):<14}{r['verdict']}")
         if r["verdict"] == "FINANCIALLY_EXPLOITABLE":
             print(f"    recipe: {r['recipe'][:120]}")
     return rows
