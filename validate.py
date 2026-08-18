@@ -63,18 +63,33 @@ def main():
         print(f"[ev] ungated_nullifier (SUSPECT): ev={fmt(s['ev_wei'])} sev={s['severity']} actionable={s['actionable']}")
         print(f"[ev] caller_vk (CONFIRMED hypoth): ev={fmt(s2['ev_wei'])} sev={s2['severity']} actionable={s2['actionable']}")
 
-        # persist
-        db.put(c, "INSERT OR REPLACE INTO targets VALUES(?,?,?,?,?,?,?)",
-               (addr, "ethereum", len(code)//2-1, None, tid, sim, db.now()))
+        # persist — lowercase keys EVERYWHERE (SQLite TEXT PKs are
+        # case-sensitive; checksummed spellings split the key space), and
+        # explicit column lists (targets has 24 cols; bare VALUES(...) with
+        # 7 values crashes — same defect class scan.py already fixed).
+        addr_lc = addr.lower()
+        db.put(c, """INSERT OR REPLACE INTO targets
+            (address, chain_id, chain, code_size, template_id, similarity,
+             deposit_sel, withdraw_sel, nullif_sel, setver_sel, verified_sel,
+             getroot_sel, roots_sel, token_sel, ecrecover_sel,
+             analyzed_ts, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (addr_lc, 1, "ethereum", len(code) // 2 - 1, tid, sim,
+                present.get("deposit", False), present.get("withdraw", False),
+                present.get("nullif", False), present.get("setver", False),
+                present.get("verify", False), present.get("getroot", False),
+                present.get("roots", False), present.get("token", False),
+                present.get("ecrecover_like", False), db.now(),
+                "HARDENED" if all(x["verdict"] in ("REVERTED_HEALTHY", "GATED_HEALTHY") for x in res) else "SUSPECT"))
         for i in inv:
             db.put(c, "INSERT OR REPLACE INTO inventory VALUES(?,?,?,?,?,?,?)",
-                   (addr, i["layer"], "ETH", str(i.get("eth_wei") or i.get("balance_wei") or 0),
+                   (addr_lc, i["layer"], "ETH", str(i.get("eth_wei") or i.get("balance_wei") or 0),
                     None, "census", db.now()))
         for r in res:
             db.put(c, "INSERT INTO probes(address,battery,probe,result,verdict,ts) VALUES(?,?,?,?,?,?)",
-                   (addr, "A_nullifier", r["probe"], json.dumps(r)[:500], r["verdict"], db.now()))
+                   (addr_lc, "A_nullifier", r["probe"], json.dumps(r)[:500], r["verdict"], db.now()))
         db.put(c, "INSERT INTO findings(address,vclass,tier,confidence,status,evidence,created) VALUES(?,?,?,?,?,?,?)",
-               (addr, "baseline_scan", "T2", "deterministic",
+               (addr_lc, "baseline_scan", "T2", "deterministic",
                 "HARDENED" if all(x["verdict"] in ("REVERTED_HEALTHY","GATED_HEALTHY") for x in res) else "SUSPECT",
                 json.dumps({"template": tid, "sim": sim, "denom": str(denom)})[:500], db.now()))
     c.close()

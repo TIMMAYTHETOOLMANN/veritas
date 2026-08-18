@@ -49,8 +49,23 @@ def main():
         status = "HARDENED" if healthy else "SUSPECT"
 
         inv = value.inventory(addr, rpc, denom=denom)
-        db.put(c, "INSERT OR REPLACE INTO targets VALUES(?,?,?,?,?,?,?)",
-               (addr, "ethereum", size, ev["first_block"], tid, sim, db.now()))
+        # DEFECT FIX: targets has 23 columns — the old 7-value insert crashed
+        # the scan on its first target ("table targets has 23 columns but 7
+        # values were supplied"). Full-column upsert below; selector flags come
+        # from the PUSH4 scan we already ran.
+        db.put(c, """INSERT OR REPLACE INTO targets
+            (address, chain_id, chain, code_size, deploy_block, bytecode_hash,
+             template_id, similarity, deposit_sel, withdraw_sel, nullif_sel,
+             setver_sel, updatever_sel, verified_sel, getroot_sel, roots_sel,
+             token_sel, ecrecover_sel, analyzed_ts, first_seen, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (addr, 1, "ethereum", size, ev["first_block"], None,
+                tid, sim, present.get("deposit", False), present.get("withdraw", False),
+                present.get("nullif", False), present.get("setver", False),
+                present.get("updatever", False), present.get("verify", False),
+                present.get("getroot", False), present.get("roots", False),
+                present.get("token", False), present.get("ecrecover_like", False),
+                db.now(), ev["first_block"], status))
         db.put(c, "INSERT OR REPLACE INTO inventory VALUES(?,?,?,?,?,?,?)",
                (addr, "L0", "ETH", str(bal), ev["last_block"], "walker", db.now()))
         db.put(c, "INSERT INTO findings(address,vclass,tier,confidence,status,evidence,created) VALUES(?,?,?,?,?,?,?)",

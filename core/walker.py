@@ -3,8 +3,12 @@
 # emitter addresses (discovery.py-style), checkpoints every chunk via state.py.
 import time
 from core import db
+from core.db import init
 from core.config import config
 from core.state import state
+
+# Auto-initialize schema on module import — survives any entry point
+init()
 
 
 # Error text that means "this endpoint refuses unauthenticated traffic":
@@ -154,14 +158,21 @@ class Walker:
                     e["deposits"] += 1
                 else:
                     e["withdrawals"] += 1
-                e["first_block"] = min(e["first_block"], b)
-                e["last_block"] = max(e["last_block"], b)
         return agg
 
-    def persist_emitters(self, agg):
+    def _raw_log_count(self, agg):
+        """Sum of raw log counts from an aggregate chunk (for truncation detection)."""
+        return sum(e["deposits"] + e["withdrawals"] for e in agg.values())
+
+    def persist_emitters(self, agg, skip=None):
+        """Persist agg. `skip` is a set of addresses already persisted by a
+        prior call — those are SKIPPED (not merged) so an abort after ≥1
+        checkpoint cannot double-count deposits/withdrawals/first/last."""
         c = db.conn()
         try:
             for addr, e in agg.items():
+                if skip and addr in skip:
+                    continue
                 row = c.execute(
                     "SELECT deposits, withdrawals, first_block, last_block "
                     "FROM emitters WHERE chain_id=? AND address=?",
@@ -210,7 +221,10 @@ class Walker:
         last_ckpt = start_block - 1
         t0 = time.time()
         t_last = t0
-        processed = 0
+        # Resume must not zero out the prior run's processed count — a no-op
+        # --resume would otherwise checkpoint processed=0 over a real count.
+        processed = (done or 0) if resume_from_state else 0
+        persisted = set()  # addresses already written by a prior checkpoint
 
         while lo <= end:
             hi = min(lo + chunk - 1, end)
@@ -221,8 +235,11 @@ class Walker:
                 # persist the checkpoint + what we have, then ABORT.
                 # A dead fleet must never be punished with chunk halving
                 # or window skips — that is silent data loss.
+                # persist ONLY the delta since the last checkpoint: persist_emitters
+                # is additive, so re-persisting the full agg would double-count
+                # deposits/withdrawals/first/last for already-written emitters.
                 state.checkpoint(self.chain_id, lo - 1, processed)
-                self.persist_emitters(agg)
+                self.persist_emitters(agg, skip=persisted)
                 self.stats["endpoints_rotated"] = self.rpc.rotations
                 self.stats["endpoints_dead"] = self.rpc.dead
                 raise
@@ -237,7 +254,11 @@ class Walker:
                       f"[{lo}..{hi}] after error: {e}")
                 lo = hi + 1
                 continue
-            if len(chunk_agg) >= config.log_cap and chunk > config.min_chunk_blocks:
+            # Truncation detection: compare RAW LOG COUNT per-topic batch
+            # (not distinct emitters — a provider truncating a 1000-block
+            # response would otherwise pass silently, since emitter count
+            # is typically <10 for TC-style windows).
+            if self._raw_log_count(chunk_agg) >= config.log_cap and chunk > config.min_chunk_blocks:
                 # response likely truncated — refetch narrower
                 chunk = max(config.min_chunk_blocks, chunk // 2)
                 self.stats["retries"] += 1
@@ -252,6 +273,7 @@ class Walker:
             if hi - last_ckpt >= checkpoint_every or lo > end:
                 state.checkpoint(self.chain_id, hi, processed)
                 self.persist_emitters(chunk_agg)
+                persisted.update(chunk_agg.keys())
                 last_ckpt = hi
             if on_chunk:
                 on_chunk(lo - 1, chunk, chunk_agg)
