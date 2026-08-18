@@ -110,8 +110,14 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
     spec = {"n_inputs": n_pub, "unconstrained": [], "vk_hash": vk["vk_hash"] if vk else ""}
     corpus = L2.generate_corpus(spec, seed=seed, n=corpus_size)
 
-    # Malleability family needs a base structured proof; derive from corpus[0].
-    base_proof = L3.assemble_proof(corpus[0]["witness"], spec["vk_hash"])
+    # Malleability family needs a base structured proof; derive from the first
+    # WITNESS-bearing corpus entry (the corpus is heterogeneous — some entries
+    # are proof-dicts with no "witness"). Never assume index 0.
+    base_witness = next((w["witness"] for w in corpus if "witness" in w), None)
+    if base_witness is not None:
+        base_proof = L3.assemble_proof(base_witness, spec["vk_hash"])
+    else:
+        base_proof = None
 
     local_oracle = bool(vk and vk.get("alpha_pair"))  # pairing check possible?
     sent = accepted = rejected = reverted = rpc_errors = 0
@@ -162,6 +168,19 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
             if verbose:
                 print("    [abort] 3+ RPC errors — fail-closed, stopping campaign")
             break
+        # HETEROGENEOUS corpus: witness-based entries (field-overflow, garbage,
+        # nullifier, config-mismatch) carry a "witness" vector and drive the
+        # verifyProof probes. gen_malleability() emits a proof-dict (class +
+        # proof + mutations) with NO "witness" key — it is consumed by the
+        # dedicated malleability_family block below, not this loop. Skipping it
+        # is required or the loop raises KeyError('witness') and aborts the
+        # whole target (observed on live pools with an extracted VK, where the
+        # malleability entry IS appended): a crash would hide the health/suspect
+        # verdict we need on the target. Fix 2026-08-18.
+        if "witness" not in w:
+            if verbose:
+                print(f"    [{w.get('class','?')}] proof-family entry — handled by malleability block")
+            continue
         proof = L3.assemble_proof(w["witness"], spec["vk_hash"])
         pubs = w["witness"][:n_pub]
         probe_one(f"w{i:03d}:{w['class']}", w["class"], proof, pubs)
@@ -170,13 +189,13 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
     # Malleability family: base + negations. Distinct proofs must NOT both
     # verify under a binding verifier; base-accepted + neg-accepted is the
     # classic no-binding signature.
-    if rpc_errors < 3:
-        pubs = corpus[0]["witness"][:n_pub]
+    if rpc_errors < 3 and base_witness is not None:
+        pubs = base_witness[:n_pub]
         for mname, mutated, expect in L3.malleability_family(base_proof):
             probe_one(f"mall:{mname}", "ZK-PROOF-MALLEABILITY", mutated, pubs)
             time.sleep(delay)
         # Cross-circuit replay: same proof material, foreign vk_hash binding.
-        foreign = L3.assemble_proof(corpus[0]["witness"], "foreign_vk_binding")
+        foreign = L3.assemble_proof(base_witness, "foreign_vk_binding")
         probe_one("xvk:cross", "ZK-VERIFIER-CONFIG-MISMATCH", foreign, pubs)
         time.sleep(delay)
 
