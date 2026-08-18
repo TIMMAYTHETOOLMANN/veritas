@@ -1,0 +1,8 @@
+[walker] chain=sepolia(11155111) endpoint=https://ethereum-sepolia-rpc.publicnode.com
+[walker] fleet=3 endpoints, latest=11509895
+[walker] sweep [8600000 .. 8601999] count=2000 chunk=auto resume=False
+[walker] topic Deposit = 0xa945e51eec50ab98c161376f0db4cf2aeba3ec92755fe2fcd388bdbbb80ff196
+[walker] topic Withdrawal = 0xe9e508bad6d4c3227e881ca19068f099da81b5164dd6d62b2eaf1e8bc6c34931
+[warn] skipping unrecoverable window [8600000..8600249] after error: rpc eth_getLogs: {'code': -32000, 'message': 'Unauthorized: You must authenticate your request with an API key. Create an account on https://www.ankr.com/rpc/ and generate your personal API key for free.'}
+[warn] skipping unrecoverable window [8600250..8600499] after error: rpc eth_getLogs: {'code': -32000, 'message': 'Unauthorized: You must authenticate your request with an API key. Create an account on https://www.ankr.com/rpc/ and generate your personal API key for free.'}
+[warn] skipping unrecoverable window [8600500..8600749] after error: rpc eth_getLogs: {'code': -32000, 'message': 'Unauthorized: You must authenticate your request with an API key. Create an account on https://www.ankr.com/rpc/ and generate your personal API key for free.'}
