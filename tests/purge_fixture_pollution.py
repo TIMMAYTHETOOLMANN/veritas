@@ -20,6 +20,9 @@ print("purging fixture finding ids:", fids)
 
 # 2. delete dependent rows first (FK conceptual order)
 for t in ["impact_sims", "exploitability"]:
+    if not fids:
+        print(f"  {t}: none (no fixture findings)")
+        continue
     ph = ",".join("?" * len(fids))
     n = c.execute(f"DELETE FROM {t} WHERE finding_id IN ({ph})", fids).rowcount
     print(f"  {t}: deleted {n}")
