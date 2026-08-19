@@ -2,9 +2,15 @@
 import json, time, urllib.request
 
 class RPC:
-    def __init__(self, url, timeout=20, retries=3):
+    def __init__(self, url, timeout=20, retries=3, user_agent=None):
         self.url, self.timeout, self.retries = url, timeout, retries
         self._id = 0
+        # Browser-like UA so public/archive RPC gateways (drpc, publicnode,
+        # tenderly) behind Cloudflare bot-wall don't 403 (http error 1010)
+        # on high-volume eth_call dif. Veritas is a read-only client.
+        self._ua = user_agent or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
     def call(self, method, params):
         self._id += 1
@@ -13,7 +19,8 @@ class RPC:
             try:
                 req = urllib.request.Request(
                     self.url, data=json.dumps(payload).encode(),
-                    headers={"Content-Type": "application/json", "User-Agent": "veritas/0.1"})
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": self._ua})
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
                     out = json.loads(r.read())
                 if "error" in out:
