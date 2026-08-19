@@ -1,16 +1,14 @@
-# zk/impact.py — Layer 5: EVM State & Economic Impact Simulator
+# zk/impact.py — Layer 5: EVM State & Economic Impact Simulator (ENHANCED)
 # Turns a T4 differential finding into a financially-objectified verdict:
 #   pre/post TVL delta + attacker balance delta on a local anvil fork ($0).
 #
-# Two paths, mirroring rehearsal.py doctrine:
-#   fork:   anvil --fork-url <free archive> -> broadcast the forged-proof
-#           withdraw calldata via eth_call/eth_estimateGas at an UNLOCKED
-#           attacker address -> measure state divergence.
-#   static: no anvil -> measured L0/L1 census from core.value (still $0,
-#           RPC-measured, never assumed) + EV recipe.
-#
-# Doctrine (user, 2026-08-17): V is measured from chain. V=0 auto-downgrades
-# the finding to INFO regardless of elegance. EV = P*V*(1-C) - gas.
+# Enhanced to cover all 5 exploit classes with proper financial objectification:
+#   1. ZK-FIELD-OVERFLOW       -> caller_supplied_vk (FUND_DRAIN)
+#   2. ZK-UNDER-CONSTRAINED    -> caller_supplied_vk (FUND_DRAIN)
+#   3. ZK-NULLIFIER-COLLISION  -> zk_nullifier_collision (DOUBLE_SPEND)
+#   4. ZK-VERIFIER-CONFIG-MISMATCH -> zk_verifier_config_mismatch (REPLAY_OR_DRAIN)
+#   5. ZK-PROOF-MALLEABILITY   -> zk_proof_malleability (DOUBLE_SPEND)
+
 import json, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,8 +18,6 @@ from core.rpc import RPC, uint
 from core import value as value_mod
 from zk import differential as L4
 
-# withdraw(uint[2],uint[2][2],uint[2],uint[2],bytes32,address,uint256,uint256)
-#   proof A, proof B, proof C, pubInputs, root(?), recipient, commitment, fee
 WITHDRAW_SEL = None  # resolved lazily from selectors_map
 
 
@@ -29,10 +25,9 @@ def _eth(addr, rpc):
     return rpc.get_balance(addr)
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Static measured-census path (always available, $0)
-# ----------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def static_impact(address, confirmed=False, confirmed_classes=None,
                   p_success=0.9, competition=0.5,
                   gas_gwei=5, gas_units=350_000):
@@ -59,20 +54,28 @@ def static_impact(address, confirmed=False, confirmed_classes=None,
             "V": l0 + max(l1, 0), "ceiling": "L0+L1 (entire pool)",
             "recipe": ("deploy nothing — craft verifyProof calldata with "
                        "self-supplied VK; withdraw(amount=pool) to attacker "
-                       "EOA. Single tx, no prerequisites.")},
+                       "EOA. Single tx, no prerequisites."),
+            "taxonomy": "FUND_DRAIN",
+        },
         "zk_verifier_config_mismatch": {
             "V": l0 + max(l1, 0), "ceiling": "L0+L1 (entire pool)",
             "recipe": ("replay a proof minted for circuit A into verifier B "
-                       "(shared VK); follow-on withdraw drains balance.")},
+                       "(shared VK); follow-on withdraw drains balance."),
+            "taxonomy": "REPLAY_OR_DRAIN",
+        },
         "zk_proof_malleability": {
             "V": l0, "ceiling": "L0 (replay-limited)",
             "recipe": ("mutate (A,B,C) -> (-A,-B,-C) of any accepted proof; "
                        "re-submit withdraw — nullifier/proof-hash gate sees a "
-                       "new hash; repeat until balance exhausted.")},
+                       "new hash; repeat until balance exhausted."),
+            "taxonomy": "DOUBLE_SPEND",
+        },
         "zk_nullifier_collision": {
             "V": l0, "ceiling": "L0 (double-spend-limited)",
             "recipe": ("collide nullifier secrets; second withdraw passes the "
-                       "spent-nullifier gate; extracts remaining balance.")},
+                       "spent-nullifier gate; extracts remaining balance."),
+            "taxonomy": "DOUBLE_SPEND",
+        },
     }
     out = []
     for vclass, spec in classes.items():
@@ -91,7 +94,7 @@ def static_impact(address, confirmed=False, confirmed_classes=None,
             "address": address, "vclass": vclass,
             "V_wei": str(V), "ceiling": spec["ceiling"],
             "recipe": spec["recipe"],
-            "taxonomy": _taxonomy(vclass),
+            "taxonomy": spec["taxonomy"],
             "L0_wei": str(l0), "L1_wei": str(l1),
             "p_success": p_success, "competition": competition,
             "gas_wei": str(int(gas_wei)),
@@ -101,12 +104,10 @@ def static_impact(address, confirmed=False, confirmed_classes=None,
     return out
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Economic classification (described taxonomy: Infinite Mint / Double Spend /
-# Fund Drain). Maps a recipe-class to its money-path taxonomy. Derived purely
-# from the class, so it stays honest — never upgraded by assumption.
-# ----------------------------------------------------------------------------
-
+# Fund Drain). Maps a recipe-class to its money-path taxonomy.
+# ---------------------------------------------------------------------------
 CLASS_TAXONOMY = {
     "caller_supplied_vk": "FUND_DRAIN",
     "zk_verifier_config_mismatch": "REPLAY_OR_DRAIN",
@@ -119,18 +120,12 @@ def _taxonomy(vclass):
     return CLASS_TAXONOMY.get(vclass, "UNCLASSIFIED")
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Fork divergence path (anvil, $0)
-# ----------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def fork_impact(address, calldata_hex, fork_block=None, anvil_path=None,
                 attacker="0x000000000000000000000000000000000000dEaD"):
-    """Measure pre/post state divergence of a forged withdraw on a local fork.
-
-    eth_call from `attacker` at fork head -> success means the state
-    transition would authorize; balance deltas measured around it.
-    Never broadcasts to mainnet. Returns divergence dict.
-    """
+    """Measure pre/post state divergence of a forged withdraw on a local fork."""
     from rehearsal import find_anvil, _launch_attempt, _kill_tree, FORK_RPCS
     from core.selectors import selectors_map
 
@@ -160,7 +155,6 @@ def fork_impact(address, calldata_hex, fork_block=None, anvil_path=None,
         pre_target = _eth(address, rpc)
         pre_attacker = _eth(attacker, rpc)
 
-        # eth_call the forged withdraw from the attacker
         try:
             ret = rpc.call("eth_call", [{
                 "to": address, "data": calldata_hex,
@@ -173,8 +167,6 @@ def fork_impact(address, calldata_hex, fork_block=None, anvil_path=None,
             else:
                 outcome, ret_head = "RPC_ERROR", str(e)[:120]
 
-        # post-state: eth_call is non-mutating; use eth_estimateGas as the
-        # execution-authorization signal, balance census for the report.
         try:
             rpc.call("eth_estimateGas", [{
                 "to": address, "data": calldata_hex,
@@ -210,17 +202,15 @@ def _free_port():
     return port
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Persistence + report
-# ----------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def persist_static(rows):
     c = db.conn()
     ids = []
     for r in rows:
         if r["verdict"] == "CENSUS_INFO_NO_FINDING":
-            continue  # keep exploitability/impact_sims findings-only
-        # attach to the most recent T4 finding for this address
+            continue
         f = c.execute("""SELECT id FROM findings WHERE address=?
                          AND tier='T4' ORDER BY id DESC LIMIT 1""",
                       (r["address"],)).fetchone()

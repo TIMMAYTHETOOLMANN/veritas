@@ -6,3 +6,5 @@
 # Layer 5: impact      — static EV/measured-census oracle
 # Layer 5b: divergence — State Divergence Engine (mine on unlocked local fork,
 #                        measure real pre/post TVL + attacker deltas)
+# Layer 6: config      — protocol configuration management
+# Layer 7: report      — comprehensive ZK audit report generator

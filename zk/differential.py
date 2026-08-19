@@ -1,4 +1,4 @@
-# zk/differential.py — Layer 4: The Differential Loop
+# zk/differential.py — Layer 4: The Differential Loop (ENHANCED)
 # Chains L1 (extract) -> L2 (witness) -> L3 (core_engine) -> on-chain verifier.
 #
 # Differential principle: the local py_ecc pairing oracle is ground truth for
@@ -10,6 +10,14 @@
 #
 # All on-chain interaction is eth_call ($0). Fail-closed verdicts per probes.py
 # doctrine: transport failure is RPC_ERROR, never healthy.
+#
+# Enhanced to probe all 5 exploit classes:
+#   1. ZK-FIELD-OVERFLOW       — boundary-value witnesses
+#   2. ZK-UNDER-CONSTRAINED    — garbage witnesses for unconstrained wires
+#   3. ZK-NULLIFIER-COLLISION  — secret pairs targeting nullifier collisions
+#   4. ZK-VERIFIER-CONFIG-MISMATCH — cross-circuit replay, input truncation
+#   5. ZK-PROOF-MALLEABILITY   — (A,B,C) point mutations
+
 import json, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +28,7 @@ from core.selectors import selectors_map
 from zk import extract as L1
 from zk import witness as L2
 from zk import core_engine as L3
+from zk import config as ZKCFG
 
 RPC_URL = "https://ethereum-rpc.publicnode.com"
 GAS_CEILING = 350_000  # verifyProof + withdraw headroom estimate
@@ -43,7 +52,6 @@ def _truthy(ret):
     body = ret[2:]
     if set(body) == {"0"}:
         return False
-    # abi-encoded bool true is 32 bytes of zeros + 1; any nonzero word counts
     return True
 
 
@@ -70,10 +78,9 @@ def on_chain_check(rpc, address, calldata):
             "ret": (ret or "")[:10]}
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Campaign
-# ----------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
                  delay=0.35, persist=True, verbose=True):
     """Full differential campaign against one deployed verifier.
@@ -90,8 +97,6 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
         return {"address": address, "error": "no bytecode", "sent": 0}
     vk = L1.extract_vk_from_bytecode(code)
     if persist:
-        # extract_vk_for_address re-fetches code; reuse the parse we already
-        # did to avoid a second RPC round-trip: inline the persist here.
         c = db.conn()
         if vk:
             c.execute("""INSERT OR REPLACE INTO vk_registry
@@ -106,7 +111,7 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
         c.commit(); c.close()
 
     # ---- L2: corpus ---------------------------------------------------------
-    n_pub = max(1, (vk["ic_count"] - 1)) if vk else 2  # tornado convention
+    n_pub = max(1, (vk["ic_count"] - 1)) if vk else 2
     spec = {"n_inputs": n_pub, "unconstrained": [], "vk_hash": vk["vk_hash"] if vk else ""}
     corpus = L2.generate_corpus(spec, seed=seed, n=corpus_size)
 
@@ -119,9 +124,9 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
     else:
         base_proof = None
 
-    local_oracle = bool(vk and vk.get("alpha_pair"))  # pairing check possible?
+    local_oracle = bool(vk and vk.get("alpha_pair"))
     sent = accepted = rejected = reverted = rpc_errors = 0
-    hits = []  # differential violations
+    hits = []
 
     def probe_one(label, vclass, proof, pubs, expect_local_invalid=True):
         nonlocal sent, accepted, rejected, reverted, rpc_errors
@@ -136,24 +141,18 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
             loc = None
             confirmed = False
             if local_oracle and expect_local_invalid:
-                loc = L3.groth16_verify(vk, proof, pubs)  # ground truth
+                loc = L3.groth16_verify(vk, proof, pubs)
                 confirmed = (loc is False)
             elif not local_oracle:
-                # No VK extracted -> no local oracle. But a properly
-                # functioning verifier with a hardcoded VK MUST reject
-                # structured random proofs. On-chain ACCEPT without a
-                # valid VK is itself the soundness violation: the contract
-                # does no real verification (stub, missing pairing call,
-                # or caller-supplied VK that the attacker controls).
-                # Cross-circuit replay (xvk:cross) acceptance confirms it
-                # is not circuit-bound.
                 loc = "NO_VK_ACCEPTED"
                 confirmed = True
-            hits.append({"label": label, "class": vclass, "on_chain": on,
-                         "local_oracle_valid": loc,
-                         "confirmed": confirmed,
-                         "witness_head": [str(x) for x in pubs[:4]],
-                         "calldata_head": calldata[:78]})
+            hits.append({
+                "label": label, "class": vclass, "on_chain": on,
+                "local_oracle_valid": loc,
+                "confirmed": confirmed,
+                "witness_head": [str(x) for x in pubs[:4]],
+                "calldata_head": calldata[:78],
+            })
         else:
             if on["outcome"] == "REVERTED":
                 reverted += 1
@@ -163,40 +162,61 @@ def run_campaign(address, rpc_url=None, corpus_size=64, seed=0x5EED,
             print(f"    [{label}] {vclass}: {on['outcome']}")
         return None
 
+    # ---- Probe all corpus entries -------------------------------------------
     for i, w in enumerate(corpus):
         if rpc_errors >= 3:
             if verbose:
                 print("    [abort] 3+ RPC errors — fail-closed, stopping campaign")
             break
-        # HETEROGENEOUS corpus: witness-based entries (field-overflow, garbage,
-        # nullifier, config-mismatch) carry a "witness" vector and drive the
-        # verifyProof probes. gen_malleability() emits a proof-dict (class +
-        # proof + mutations) with NO "witness" key — it is consumed by the
-        # dedicated malleability_family block below, not this loop. Skipping it
-        # is required or the loop raises KeyError('witness') and aborts the
-        # whole target (observed on live pools with an extracted VK, where the
-        # malleability entry IS appended): a crash would hide the health/suspect
-        # verdict we need on the target. Fix 2026-08-18.
+
+        # HETEROGENEOUS corpus: witness-based entries drive verifyProof probes.
+        # gen_malleability() emits a proof-dict (class + proof + mutations) with
+        # NO "witness" key — it is consumed by the dedicated malleability block
+        # below, not this loop.
         if "witness" not in w:
             if verbose:
                 print(f"    [{w.get('class','?')}] proof-family entry — handled by malleability block")
             continue
+
         proof = L3.assemble_proof(w["witness"], spec["vk_hash"])
         pubs = w["witness"][:n_pub]
         probe_one(f"w{i:03d}:{w['class']}", w["class"], proof, pubs)
         time.sleep(delay)
 
-    # Malleability family: base + negations. Distinct proofs must NOT both
-    # verify under a binding verifier; base-accepted + neg-accepted is the
-    # classic no-binding signature.
+        # ---- Class 3: Nullifier collision — probe the collision pair ----
+        if w["class"] == "ZK-NULLIFIER-COLLISION":
+            # The collision pair is two secrets; probe both as separate witnesses
+            for j, secret in enumerate(w["witness"]):
+                proof2 = L3.assemble_proof([secret] + [0] * (n_pub - 1), spec["vk_hash"])
+                probe_one(f"nf{i:03d}:{j}", "ZK-NULLIFIER-COLLISION", proof2, [secret] + [0] * (n_pub - 1))
+                time.sleep(delay)
+
+        # ---- Class 4: Config mismatch — probe with truncated/extra inputs ----
+        if w["class"] == "ZK-VERIFIER-CONFIG-MISMATCH":
+            # Truncated public inputs (strip one word)
+            truncated = pubs[:-1] if len(pubs) > 1 else pubs
+            probe_one(f"cfg:{i}:trunc", "ZK-VERIFIER-CONFIG-MISMATCH", proof, truncated)
+            time.sleep(delay)
+            # Extra dummy public inputs
+            extra = pubs + [0]
+            probe_one(f"cfg:{i}:extra", "ZK-VERIFIER-CONFIG-MISMATCH", proof, extra)
+            time.sleep(delay)
+
+    # ---- Class 5: Malleability family ---------------------------------------
     if rpc_errors < 3 and base_witness is not None:
         pubs = base_witness[:n_pub]
         for mname, mutated, expect in L3.malleability_family(base_proof):
             probe_one(f"mall:{mname}", "ZK-PROOF-MALLEABILITY", mutated, pubs)
             time.sleep(delay)
-        # Cross-circuit replay: same proof material, foreign vk_hash binding.
+
+        # Cross-circuit replay: same proof material, foreign vk_hash binding
         foreign = L3.assemble_proof(base_witness, "foreign_vk_binding")
         probe_one("xvk:cross", "ZK-VERIFIER-CONFIG-MISMATCH", foreign, pubs)
+        time.sleep(delay)
+
+        # Nullifier replay: same proof, different nullifier context
+        null2 = L3.assemble_proof(base_witness, "nullifier_replay_binding")
+        probe_one("xvk:null", "ZK-VERIFIER-CONFIG-MISMATCH", null2, pubs)
         time.sleep(delay)
 
     campaign = {
@@ -230,7 +250,6 @@ def _persist(campaign):
          campaign["reverted"], campaign["backend"],
          json.dumps(campaign["hits"])[:4000], db.now()))
     campaign_id = cur.lastrowid
-    # Every confirmed hit (on-chain ACCEPT + no valid math backing) is a finding.
     for h in campaign["hits"]:
         critical = h.get("confirmed", False)
         confidence = "differential_confirmed" if critical else "suspect"
@@ -256,10 +275,9 @@ def _persist(campaign):
     return campaign_id
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Rollup
-# ----------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def summarize(campaign):
     a = campaign["address"]
     print(f"\n[t4] campaign {a}")

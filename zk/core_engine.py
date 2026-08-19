@@ -12,20 +12,89 @@ R = 2188824287183927522224640574525727508854836440041603434369820418657580849561
 
 _BACKEND = None
 
+def _try_icicle_imports():
+    """Try multiple paths for the real Icicle ZK library (Rust/C++ bindings).
+
+    The real Icicle (github.com/iden3/icicle) is NOT a pip-installable Python
+    package — it ships as C++/Rust native extensions with language-specific
+    bindings. The Python bindings live under different names depending on the
+    build target. We probe all known entry points here.
+    """
+    candidates = [
+        # Direct icicle bindings (built from source)
+        ("icicle", "icicle-cuda"),
+        ("icicle_cuda", "icicle-cuda"),
+        ("icicle_bn254", "icicle-cuda"),
+        ("icicle.curves", "icicle-cuda"),
+        # CUDA runtime detection (torch-backed fallback)
+        ("torch", "cuda-torch"),
+        # GPU acceleration via cupy
+        ("cupy", "cuda-cupy"),
+        # pycuda raw
+        ("pycuda", "cuda-pycuda"),
+    ]
+    for modname, label in candidates:
+        try:
+            __import__(modname)
+            return label
+        except ImportError:
+            continue
+    return None
+
+
+def _has_cuda():
+    """Detect CUDA/GPU availability without importing heavy deps."""
+    import subprocess
+    # Check for nvidia-smi (fast, no import)
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return True, result.stdout.strip().split("\n")[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False, None
+
+
 def detect_backend():
     global _BACKEND
     if _BACKEND is not None:
         return _BACKEND
+
+    # 1. Try Icicle native bindings (the real GPU backend)
+    icicle_label = _try_icicle_imports()
+    if icicle_label:
+        _BACKEND = icicle_label
+        return _BACKEND
+
+    # 2. Try CUDA detection via nvidia-smi (lightweight, no heavy import)
+    has_cuda, gpu_name = _has_cuda()
+    if has_cuda:
+        # CUDA is present but no Icicle bindings — we can still use py_ecc
+        # with the GPU name for reporting purposes
+        _BACKEND = f"py_ecc-cpu (CUDA GPU detected: {gpu_name}, no Icicle bindings)"
+        return _BACKEND
+
+    # 3. Fallback: pure-Python py_ecc (correct, laptop-class)
     try:
-        import icicle  # noqa
-        _BACKEND = "icicle-cuda"
+        from py_ecc import bn128  # noqa
+        _BACKEND = "py_ecc-cpu"
     except ImportError:
-        try:
-            from py_ecc import bn128  # noqa
-            _BACKEND = "py_ecc-cpu"
-        except ImportError:
-            _BACKEND = "none"
+        _BACKEND = "none"
     return _BACKEND
+
+
+def backend_info():
+    """Return detailed backend information for reporting."""
+    info = {"backend": detect_backend()}
+    has_cuda, gpu_name = _has_cuda()
+    info["cuda_available"] = has_cuda
+    if gpu_name:
+        info["gpu_name"] = gpu_name
+    info["icicle_bindings"] = _try_icicle_imports() is not None
+    return info
 
 
 # ----------------------------------------------------------------------------
