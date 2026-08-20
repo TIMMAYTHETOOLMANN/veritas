@@ -30,6 +30,7 @@ from zk import pocgen
 from zk import witness as L2
 from zk import config as ZKCFG
 from zk import report as ZKRPT
+from zk import reachability as ZKRCH
 
 # T4 witness-class -> T5 recipe-class mapping
 HIT_CLASS_MAP = {
@@ -222,6 +223,16 @@ Examples:
     ap.add_argument("--json", help="write report to JSON file")
     ap.add_argument("--list-targets", action="store_true",
                     help="list known targets and exit")
+    ap.add_argument("--reach", action="store_true", default=True,
+                    help="run T2 economic-reachability gate before fuzzing (default)")
+    ap.add_argument("--no-reach", action="store_true",
+                    help="skip the reachability gate (DANGER: fuzz even "
+                         "verifier-isolated targets)")
+    ap.add_argument("--reach-only", action="store_true",
+                    help="classify target(s) by money-path reachability and exit; "
+                         "add --all to classify every known target (incl. HARDENED)")
+    ap.add_argument("--list-reachable", action="store_true",
+                    help="list targets currently classified VIABLE by the gate")
     args = ap.parse_args()
 
     db.init()
@@ -229,6 +240,40 @@ Examples:
     # ---- List targets ----
     if args.list_targets:
         list_targets()
+        return
+
+    # ---- T2 Economic-Reachability classifier mode ----
+    if args.reach_only or args.list_reachable:
+        analyzer = ZKRCH.MoneyPathAnalyzer(
+            RPC(args.rpc) if args.rpc else None)
+        if args.list_reachable and not args.reach_only:
+            viable = ZKRCH.reachable_targets(chain_id=1)
+            print(f"\n{'ADDR':<44}{'VERDICT':<30}CODE")
+            print("-" * 78)
+            for r in viable:
+                print(f"{r['address']:<44}{r['verdict']:<30}{r.get('code_size',0)}")
+            print(f"\nTotal viable: {len(viable)}")
+            return
+        # reach-only: classify requested target(s)
+        if args.all:
+            c = db.conn()
+            tgt = [r["address"] for r in c.execute(
+                "SELECT address FROM targets ORDER BY address")]
+            c.close()
+        elif args.target:
+            tgt = [args.target.strip().lower()]
+        else:
+            ap.error("--reach-only requires --target or --all")
+        print(f"[reach] classifying {len(tgt)} target(s)...\n")
+        for a in tgt:
+            v = analyzer.classify(a, chain_id=1)
+            analyzer.store(v)
+            print(f"  {a}")
+            print(f"     verdict: {v['verdict']}")
+            print(f"     reason : {v['reason']}")
+            if v.get("literal_verifier_candidates"):
+                print(f"     verifier candidates: {v['literal_verifier_candidates']}")
+        print(f"\n[reach] done — verdicts persisted to veritas.db 'reachability'")
         return
 
     # ---- Report mode ----
@@ -271,12 +316,39 @@ Examples:
 
     print(f"[fuzz] {len(targets)} target(s) | corpus={args.corpus} "
           f"seed={hex(args.seed)} delay={args.delay}s")
+    if not args.no_reach:
+        print(f"[reach] T2 economic-reachability gate ENABLED "
+              f"(use --no-reach to bypass)")
+    else:
+        print(f"[WARN] --no-reach: T2 gate DISABLED — will fuzz verifier-isolated "
+              f"targets that have no money path (spends RPC on known dead-ends).")
 
     results = []
+    blocked = []
     for i, addr in enumerate(targets, 1):
         print(f"\n{'#'*72}")
         print(f"# [{i}/{len(targets)}] {addr}")
         print(f"{'#'*72}")
+
+        # ---- T2 economic-reachability gate (pre-T4) ----
+        if not args.no_reach:
+            analyzer = ZKRCH.MoneyPathAnalyzer(
+                RPC(args.rpc) if args.rpc else None)
+            verdict = analyzer.classify(addr, chain_id=1)
+            analyzer.store(verdict)
+            blk = {"address": addr, "verdict": verdict["verdict"],
+                   "reason": verdict["reason"]}
+            if verdict["verdict"] in ("VERIFIER_ISOLATED", "NO_MONEY_PATH",
+                                      "UNKNOWN", "NO_CODE"):
+                print(f"[reach] BLOCKED {addr} — {verdict['verdict']}")
+                print(f"[reach]   {verdict['reason']}")
+                blocked.append(blk)
+                results.append({"address": addr,
+                                "error": f"REACHABILITY_BLOCKED:{verdict['verdict']}"})
+                continue
+            print(f"[reach] OK {addr} — {verdict['verdict']} "
+                  f"(proceeding to T4 fuzz; gate is UNBLOCKING, fire still needs "
+                  f"explicit T6 command)")
         try:
             camp = run_fuzz_target(
                 addr,
@@ -313,6 +385,12 @@ Examples:
         print(f"  {a}: sent={r.get('sent',0)} accepted={accepted} "
               f"hits={hits} confirmed={confirmed} "
               f"poc={'yes' if r.get('poc') else 'no'}")
+    if blocked:
+        print(f"\n[reach] Blocked {len(blocked)} target(s) with no viable money path "
+              f"(no fuzz cycles spent):")
+        for b in blocked:
+            print(f"  - {b['address']}: {b['verdict']}")
+        print(f"  Use `--no-reach` to force-fuzz them anyway (discouraged).")
 
     return 0
 

@@ -132,6 +132,20 @@ CREATE TABLE IF NOT EXISTS fuzz_campaigns(
   backend TEXT,
   findings_json TEXT,
   ts INTEGER);
+-- ==== T2 Economic-Reachability Gate ====
+CREATE TABLE IF NOT EXISTS reachability(
+  address TEXT NOT NULL,
+  chain_id INTEGER NOT NULL,
+  verdict TEXT,
+  reason TEXT,
+  has_verify INTEGER,
+  has_withdraw INTEGER,
+  has_setver INTEGER,
+  has_updatever INTEGER,
+  literal_verifier_candidates TEXT,
+  code_size INTEGER,
+  analyzed_ts INTEGER,
+  PRIMARY KEY(address, chain_id));
 """
 
 # user_version gates destructive/migrating steps. v0 (legacy) init() dropped the
