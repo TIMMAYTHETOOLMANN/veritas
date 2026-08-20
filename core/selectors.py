@@ -9,6 +9,7 @@ def selector(sig: str) -> str:
 
 # Canonical signature corpus (extend freely — this is the T0 fingerprint DB)
 SIGS = {
+    # Tornado family
     "deposit":  "deposit(bytes32)",
     "withdraw": "withdraw(uint256[2],uint256[2][2],uint256[2],uint256[2],bytes32,address,uint256,uint256)",
     "verify":   "verifyProof(uint256[2],uint256[2][2],uint256[2],uint256[2])",
@@ -21,13 +22,38 @@ SIGS = {
     "setver":   "setVerifier(address)",
     "updatever":"updateVerifier(address)",
     "ecrecover_like": "recover(address,uint256,uint256,bytes32,bytes32,uint8)",
+    # Railgun family (broadcaster + shield)
+    "railgun_deposit":    "Deposit(bytes32,uint256,address)",
+    "railgun_withdraw":   "Withdraw(bytes32,uint256,address,bytes)",
+    "railgun_verify":     "verifyProof(bytes,bytes32)",
+    "railgun_broadcast":  "broadcast(bytes,bytes32)",
+    # Aztec family (private execution)
+    "aztec_deposit":      "Deposit(bytes32,uint256,address)",
+    "aztec_withdraw":     "Withdraw(bytes32,uint256,address)",
+    "aztec_verify":       "verifyProof(bytes32,bytes)",
+    # Generic ZK rollup / privacy pool patterns
+    "zk_deposit":         "Deposit(bytes32,uint256)",
+    "zk_withdraw":        "Withdraw(bytes32,uint256,address)",
+    "zk_verify":          "verifyProof(bytes,bytes32)",
+    # Upgradable verifier pattern
+    "upgrade_setver":     "setVerifier(address)",
+    "upgrade_updatever":  "updateVerifier(address)",
+    "upgrade_verify":     "verifyProof(uint256[2],uint256[2][2],uint256[2],uint256[2])",
 }
 
 TEMPLATES = {
     # Tornado-family mixer: hardcoded VK, nullifier mapping, merkle roots
     "tornado_v2": ["deposit", "withdraw", "verify", "getroot", "nullif", "roots", "denom", "levels"],
     # Upgradable-verifier family (the dangerous config class)
-    "zk_upgradable": ["withdraw", "verify", "setver"],
+    "zk_upgradable": ["withdraw", "verify", "setver", "updatever"],
+    # Railgun family
+    "railgun": ["railgun_deposit", "railgun_withdraw", "railgun_verify", "railgun_broadcast"],
+    # Aztec family
+    "aztec": ["aztec_deposit", "aztec_withdraw", "aztec_verify"],
+    # Generic ZK privacy pool (deposit + withdraw + verify gate)
+    "zk_pool": ["zk_deposit", "zk_withdraw", "zk_verify"],
+    # Upgradable verifier pattern (setVerifier + updateVerifier + verify)
+    "upgradable_verifier": ["upgrade_setver", "upgrade_updatever", "upgrade_verify"],
 }
 
 def selectors_map():

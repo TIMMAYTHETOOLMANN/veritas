@@ -13,8 +13,18 @@ def topic0(sig: str) -> str:
 # Verified-correct topics (identical to core/discovery.py TOPICS, computed
 # from the only event shapes with known signatures).
 EVENT_TOPICS = {
+    # Tornado family
     "Deposit":    topic0("Deposit(bytes32,uint32,uint256)"),
     "Withdrawal": topic0("Withdrawal(address,bytes32,address,uint256)"),
+    # Railgun family
+    "RailgunDeposit":  topic0("Deposit(bytes32,uint256,address)"),
+    "RailgunWithdraw": topic0("Withdraw(bytes32,uint256,address,bytes)"),
+    # Aztec family
+    "AztecDeposit":  topic0("Deposit(bytes32,uint256,address)"),
+    "AztecWithdraw": topic0("Withdraw(bytes32,uint256,address)"),
+    # Generic ZK privacy pool
+    "ZkDeposit":  topic0("Deposit(bytes32,uint256)"),
+    "ZkWithdraw": topic0("Withdraw(bytes32,uint256,address)"),
 }
 
 class Config:
@@ -25,6 +35,19 @@ class Config:
              "https://ethereum-rpc.publicnode.com", dict(EVENT_TOPICS), 0),
             (11155111, "sepolia",
              "https://ethereum-sepolia-rpc.publicnode.com", dict(EVENT_TOPICS), 0),
+            # L2s — ZK protocol activity centers
+            (42161, "arbitrum",
+             "https://arb1.arbitrum.io/rpc", dict(EVENT_TOPICS), 0),
+            (10, "optimism",
+             "https://mainnet.optimism.io", dict(EVENT_TOPICS), 0),
+            (324, "zksync",
+             "https://mainnet.era.zksync.io", dict(EVENT_TOPICS), 0),
+            (534352, "scroll",
+             "https://rpc.scroll.io", dict(EVENT_TOPICS), 0),
+            (59144, "linea",
+             "https://rpc.linea.build", dict(EVENT_TOPICS), 0),
+            (8453, "base",
+             "https://mainnet.base.org", dict(EVENT_TOPICS), 0),
         ]
         # Per-chain RPC fleets — rotation must NEVER cross chains.
         # ankr endpoints (rpc.ankr.com/eth, rpc.ankr.com/eth_sepolia) were
@@ -58,6 +81,37 @@ class Config:
             11155111: [
                 "https://ethereum-sepolia-rpc.publicnode.com",
                 "https://gateway.tenderly.co/public/sepolia",
+            ],
+            # L2 fleets — public endpoints, no API keys required
+            42161: [  # Arbitrum
+                "https://arb1.arbitrum.io/rpc",
+                "https://arbitrum.drpc.org",
+                "https://arbitrum.publicnode.com",
+            ],
+            10: [  # Optimism
+                "https://mainnet.optimism.io",
+                "https://optimism.drpc.org",
+                "https://optimism.publicnode.com",
+            ],
+            324: [  # zkSync Era
+                "https://mainnet.era.zksync.io",
+                "https://zksync.drpc.org",
+                "https://zksync.publicnode.com",
+            ],
+            534352: [  # Scroll
+                "https://rpc.scroll.io",
+                "https://scroll.drpc.org",
+                "https://scroll.publicnode.com",
+            ],
+            59144: [  # Linea
+                "https://rpc.linea.build",
+                "https://linea.drpc.org",
+                "https://linea.publicnode.com",
+            ],
+            8453: [  # Base
+                "https://mainnet.base.org",
+                "https://base.drpc.org",
+                "https://base.publicnode.com",
             ],
         }
         # Back-compat alias (mainnet fleet).

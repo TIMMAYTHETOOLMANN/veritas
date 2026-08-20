@@ -1,11 +1,26 @@
 # core/discovery.py — T0 event-graph walker: eth_getLogs topic sweep, $0, no API keys
 # Finds every contract emitting Tornado-family Deposit/Withdrawal events,
 # including forks with modified bytecode (event shapes survive forking).
+# Also finds Railgun, Aztec, and generic ZK privacy pool events.
 from core.selectors import kec256
 
+def topic0(sig: str) -> str:
+    """Full 32-byte keccak256 event topic for an event signature."""
+    return "0x" + kec256(sig.encode()).hex()
+
 TOPICS = {
-    "deposit":    "0x" + kec256(b"Deposit(bytes32,uint32,uint256)").hex(),
-    "withdrawal": "0x" + kec256(b"Withdrawal(address,bytes32,address,uint256)").hex(),
+    # Tornado family
+    "deposit":    topic0("Deposit(bytes32,uint32,uint256)"),
+    "withdrawal": topic0("Withdrawal(address,bytes32,address,uint256)"),
+    # Railgun family
+    "railgun_deposit":  topic0("Deposit(bytes32,uint256,address)"),
+    "railgun_withdraw": topic0("Withdraw(bytes32,uint256,address,bytes)"),
+    # Aztec family
+    "aztec_deposit":  topic0("Deposit(bytes32,uint256,address)"),
+    "aztec_withdraw": topic0("Withdraw(bytes32,uint256,address)"),
+    # Generic ZK privacy pool
+    "zk_deposit":  topic0("Deposit(bytes32,uint256)"),
+    "zk_withdraw": topic0("Withdraw(bytes32,uint256,address)"),
 }
 
 def walk(rpc, topic, from_block, to_block, chunk=9000, hard_floor=500, log_cap=1800):
