@@ -41,14 +41,12 @@ def analyze_emitter(chain_id, address, rpc_url=None):
         code.encode() if isinstance(code, str) else code
     ).hexdigest()
     
-    # Check if we've seen this exact bytecode before (global dedup)
-    c = conn()
-    dup = c.execute(
-        "SELECT COUNT(*) FROM targets WHERE bytecode_hash=?", (bc_hash,)
-    ).fetchone()[0]
+    # Check if we've seen this exact bytecode before.
+    # NOTE (fix 2026-08-20): global bytecode dedup is ECONOMY-BLIND — byte-
+    # identical clones at different addresses hold DIFFERENT balances and
+    # merkle trees. Dedup is now per-address only (handled by the check above
+    # + INSERT OR REPLACE). Same bytecode at a new address IS a new target.
     c.close()
-    if dup > 0:
-        return None  # already analyzed
     
     # Scan for selectors
     present = scan_code(code)

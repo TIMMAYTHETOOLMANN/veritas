@@ -29,6 +29,6 @@ for imag_first in (True, False):
     try:
         r_good = call_precompile("0x" + good)
         r_bad  = call_precompile("0x" + bad)
-        print(f"{tag}: e*e-1 -> {r_good[:10]}...  e*e -> {r_bad[:10]}...")
+        print(f"{tag}: good[full]={r_good}  bad[full]={r_bad}")
     except Exception as e:
         print(f"{tag}: RPC/execution error: {e}")
