@@ -22,6 +22,17 @@ SIGS = {
     "setver":   "setVerifier(address)",
     "updatever":"updateVerifier(address)",
     "ecrecover_like": "recover(address,uint256,uint256,bytes32,bytes32,uint8)",
+    # Tornado-CLONE family (verified 2026-08-20 via 4byte + fork probes).
+    # These pools do NOT use the canonical tornado selectors — the money path
+    # routes through these custom sigs: withdraw -> verifyProof on a
+    # storage-resolved verifier (verifier() getter).
+    "clone_withdraw":  "withdraw(bytes,bytes32,bytes32,address,address,uint256,uint256)",
+    "clone_verify":    "verifyProof(bytes,uint256[6])",
+    "clone_operator":  "operator()",
+    "clone_changeop":  "changeOperator(address)",
+    "clone_verifier":  "verifier()",
+    "clone_deposit":   "deposit(bytes32)",
+    "clone_hasher":    "hasher()",
     # Railgun family (broadcaster + shield)
     "railgun_deposit":    "Deposit(bytes32,uint256,address)",
     "railgun_withdraw":   "Withdraw(bytes32,uint256,address,bytes)",

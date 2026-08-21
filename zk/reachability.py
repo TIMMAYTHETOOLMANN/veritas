@@ -179,59 +179,90 @@ class MoneyPathAnalyzer:
         # hex, so normalize to a shared space (lowercase, no '0x').
         sm_inv = {v.lower().replace("0x", ""): k for k, v in sm.items()}
         present_names = {sm_inv[s] for s in dispatched if s in sm_inv}
-        has_verify = "verify" in present_names
+        # 2026-08-20 CORRECTION: the tornado-CLONE family routes its money path
+        # through custom selectors (withdraw 0x21a0adb6 -> verifyProof 0x695ef6f9
+        # on a storage-resolved verifier). Keying ONLY on canonical signatures
+        # produced wrong NO_MONEY_PATH/UNKNOWN verdicts on funded pools. Count
+        # clone-family dispatches as real verify/withdraw.
+        has_verify = "verify" in present_names or "clone_verify" in present_names
         has_setver = "setver" in present_names
         has_upd = "updatever" in present_names
-        has_withdraw = "withdraw" in present_names
+        has_withdraw = ("withdraw" in present_names
+                        or "clone_withdraw" in present_names)
+        has_changeop = "clone_changeop" in present_names
+        has_verifier_getter = "clone_verifier" in present_names
 
-        # Detect the exec-reported edge case: a pool core whose withdraw is a
-        # CUSTOM selector (0x06394c9b) that does a PLAIN transfer and does NOT
-        # gate on verify — the "unexploitable" class the operator hit. We flag
-        # any withdraw dispatch that is NOT the canonical tornado withdraw.
-        custom_disp = {s for s in dispatched if s in (
-            "06394c9b",  # exec summary: pool-core withdraw = simple USDT transfer
-        )}
-        has_custom_plain_withdraw = bool(custom_disp)
+        # Resolve the storage-backed verifier via the verifier() getter (0x2b7ac3f3).
+        resolved_verifier = None
+        if has_verifier_getter:
+            try:
+                r = self._rpc.eth_call(address, "0x2b7ac3f3")
+                if r and len(r) >= 66:
+                    resolved_verifier = "0x" + r[-40:].lower()
+            except Exception:
+                pass
+
+        # Measure on-chain value. Doctrine: V is MEASURED (eth_getBalance /
+        # balanceOf), never assumed from events or denomination alone.
+        try:
+            value_eth_wei = self._rpc.get_balance(address)
+        except Exception:
+            value_eth_wei = None
+        value_token = None
+        value_token_raw = None
+        if "token" in present_names:
+            try:
+                r = self._rpc.eth_call(address, "0xfc0c546a")  # token()
+                if r and len(r) >= 66:
+                    value_token = "0x" + r[-40:].lower()
+                    bal = self._rpc.eth_call(
+                        value_token,
+                        "0x70a08231" + address[2:].rjust(64, "0"))  # balanceOf
+                    if bal and bal != "0x":
+                        value_token_raw = int(bal, 16)
+            except Exception:
+                pass
 
         # Literal addresses pushed in code (candidate verifier refs)
         lit_addrs = _extract_literal_addresses(code)
+        if resolved_verifier and resolved_verifier not in lit_addrs:
+            lit_addrs.insert(0, resolved_verifier)
 
-        # Decide taxonomy — order matters: the custom-plain-withdraw (unexploitable)
-        # case must be caught BEFORE the generic verify/withdraw heuristic.
-        if has_custom_plain_withdraw and not has_verify:
-            verdict = "NO_MONEY_PATH"
-            reason = ("withdraw dispatches via custom selector (e.g. 0x06394c9b) "
-                      "that does a PLAIN token transfer with NO verifyProof gate — "
-                      "the operator's 'unexploitable' class. Fuzzing any separate "
-                      "verifier here can never move funds. SKIP.")
+        # Decide taxonomy.
+        # 2026-08-20 CORRECTION: the old 0x06394c9b "custom plain withdraw"
+        # heuristic is REMOVED. 0x06394c9b is changeOperator(address) — NOT a
+        # withdraw. Treating it as an unexploitable plain-transfer withdraw
+        # wrongly classified three FUNDED pools (0x0836222f, 0x4736dcf1,
+        # 0xfd8610d2) as NO_MONEY_PATH. The correct gate is the real
+        # withdraw->verifyProof dispatch check below.
+        if has_withdraw and has_verify:
+            verdict = "MONEY_PATH_VERIFY_GATED"
+            vdesc = f"verifier={resolved_verifier or 'in-code'}"
+            val = f"measured V: {value_eth_wei} wei"
+            if value_token_raw:
+                val += f" + {value_token_raw} raw units of {value_token}"
+            reason = (f"withdraw dispatches to verifyProof gate ({vdesc}); "
+                      f"{val}. Fork-confirm the call graph before T4.")
         elif has_setver or has_upd:
             verdict = "UPGRADABLE_VERIFIER"
-            reason = ("setVerifier/updateVerifier present: exploitable ONLY if "
-                      "owner check is inverted (owner=0) AND no stack bug breaks "
-                      "the update call (our 3 pool cores hit both blocks). "
-                      "Probe updateVerifier on a fork to confirm.")
-        elif has_verify and has_withdraw:
-            verdict = "MONEY_PATH_VERIFY_GATED"
-            reason = ("contract carries BOTH withdraw() and verifyProof() as real "
-                      "PUSH4 dispatchers; fork-confirm that the withdraw path "
-                      "actually external-calls the verifier and moves value "
-                      "before treating as VIABLE.")
+            reason = ("setVerifier/updateVerifier present but no dispatched "
+                      "verify-gated withdraw found: exploitable ONLY if the "
+                      "operator/owner check is dead (operator=0x0) AND the "
+                      "update call works. Probe on a fork to confirm.")
         elif has_verify:
             verdict = "VERIFIER_ISOLATED"
             reason = ("verifyProof selector present as real dispatch but the "
-                      "contract does NOT carry a canonical withdraw() — fuzzing "
+                      "contract does NOT carry a withdraw() — fuzzing "
                       "this verifier yields isolated forgeries with no money path "
                       "(the 'unexploitable' class).")
         elif has_withdraw:
             verdict = "NO_MONEY_PATH"
-            reason = ("canonical withdraw() present but NO verifyProof dispatch — "
+            reason = ("withdraw() present but NO verifyProof dispatch — "
                       "withdraw is a plain token transfer with no proof gate.")
         else:
             verdict = "UNKNOWN"
-            reason = ("no recognizable proof/withdraw selectors dispatched. "
-                      "Note: none of the 5 live tornado pool cores nor the shared "
-                      "verifier dispatch the canonical withdraw(0xf2b8180e) or "
-                      "verify(0xf5c9d69e) at all — they use custom selectors.")
+            reason = ("no recognizable proof/withdraw selectors dispatched under "
+                      "canonical OR clone-family signatures (PUSH4 disassembly).")
 
         out = {
             "address": address,
@@ -240,9 +271,13 @@ class MoneyPathAnalyzer:
             "reason": reason,
             "has_verify": has_verify,
             "has_withdraw": has_withdraw,
-            "has_custom_plain_withdraw": has_custom_plain_withdraw,
+            "has_changeop": has_changeop,
             "has_setver": has_setver,
             "has_updatever": has_upd,
+            "resolved_verifier": resolved_verifier,
+            "value_eth_wei": value_eth_wei,
+            "value_token": value_token,
+            "value_token_raw": value_token_raw,
             "literal_verifier_candidates": lit_addrs[:8],
             "code_size": len(code),
             "analyzed_ts": int(time.time()),
