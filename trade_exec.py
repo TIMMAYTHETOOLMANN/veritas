@@ -256,8 +256,7 @@ def cmd_withdraw(args):
     info, ex, acct = get_exchange()
     dest = args.to or acct.address
     st = info.user_state(acct.address)
-    ms = st.get("marginSummary") or {}
-    avail = float(ms.get("withdrawable") or 0)
+    avail = float(st.get("withdrawable") or 0)
     print(f"[{'EXECUTE' if args.execute else 'DRY-RUN'}] WITHDRAW")
     print(f"  withdrawable : {avail} USDC")
     print(f"  amount       : {args.amount}")
@@ -269,10 +268,8 @@ def cmd_withdraw(args):
     if not args.execute:
         print("\n  dry run only — re-run with --execute")
         return 0
-    # SDK usd transfer: sign2 with perps destination
-    from hyperliquid.utils.types import SpotSymbol, SpotMeta
-    is_perp = True
-    result = ex.usdc_transfer(dest, f"{args.amount}", is_perp)
+    # SDK: usd_transfer(destination, amount, to_perps) — False = to wallet
+    result = ex.usd_transfer(dest, f"{args.amount}", False)
     print(json.dumps(result, indent=2, default=str))
     return 0
 
