@@ -222,10 +222,18 @@ def cmd_close(args):
     if not args.execute:
         print("\n  dry run only — re-run with --execute")
         return 0
-    from hyperliquid.utils.types import OrderType
-    result = ex.order(coin, is_buy, sz, px, OrderType.ORDER_LIMIT,
+    result = ex.order(coin, is_buy, sz, px, {"limit": {"tif": "Ioc"}},
                       reduce_only=True)
     print(json.dumps(result, indent=2, default=str))
+    status = (result.get("status") if isinstance(result, dict) else None)
+    if status == "ok":
+        try:
+            st0 = result["response"]["data"]["statuses"][0]
+            if "filled" in st0:
+                print(f"  CLOSED @ {st0['filled']['avgPx']} "
+                      f"(size {st0['filled']['totalSz']})")
+        except Exception:
+            pass
     return 0
 
 
