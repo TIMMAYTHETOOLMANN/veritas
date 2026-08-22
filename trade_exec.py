@@ -160,19 +160,40 @@ def cmd_order(args):
         print("\n  dry run only — re-run with --execute to sign and submit")
         return 0
 
-    from hyperliquid.utils.types import OrderType, OrderInfo
-    ot = OrderType.ORDER_LIMIT  # GTC limit that crosses the book
-    result = ex.order(coin, is_buy, sz, px, ot, reduce_only=False)
+    # IOC limit that crosses the book = taker fill, no resting order
+    result = ex.order(coin, is_buy, sz, px, {"limit": {"tif": "Ioc"}},
+                      reduce_only=False)
     print("\n  submit result:")
     print(json.dumps(result, indent=2, default=str))
     status = (result.get("status") if isinstance(result, dict) else None)
+    filled_px = None
     if status == "ok":
-        filled = None
         try:
-            filled = result["response"]["data"]["statuses"][0].get("filled")
-            print("  ORDER FILLED" if filled is not None else "  order resting")
+            st0 = result["response"]["data"]["statuses"][0]
+            if "filled" in st0:
+                filled_px = float(st0["filled"]["avgPx"])
+                print(f"  FILLED @ {filled_px} "
+                      f"(size {st0['filled']['totalSz']})")
+            elif "error" in st0:
+                print(f"  order error: {st0['error']}")
+                return 1
         except Exception:
             pass
+
+    # ---- hard stop: reduce-only trigger SL at the 48h-extreme-beyond price
+    if args.stop:
+        entry = filled_px or px
+        stop_px = float(args.stop)
+        # for a LONG, the stop SELLs when price falls to triggerPx;
+        # for a SHORT, the stop BUYs back when price rises
+        stop_buy = args.side == "short"
+        ot = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
+        try:
+            r2 = ex.order(coin, stop_buy, sz, stop_px, ot, reduce_only=True)
+            print(f"  hard stop placed @ {stop_px}: "
+                  f"{json.dumps(r2.get('status'))}")
+        except Exception as e:
+            print(f"  WARNING: stop placement failed: {e} — SET IT MANUALLY")
     return 0
 
 
@@ -297,6 +318,8 @@ def main():
     op.add_argument("--side", required=True, choices=["short", "long"])
     op.add_argument("--notional", type=float, required=True)
     op.add_argument("--price", type=float, default=None)
+    op.add_argument("--stop", type=float, default=None,
+                    help="hard stop price (reduce-only trigger SL, placed with entry)")
     op.add_argument("--execute", action="store_true")
     cp = sub.add_parser("close")
     cp.add_argument("--coin", required=True)

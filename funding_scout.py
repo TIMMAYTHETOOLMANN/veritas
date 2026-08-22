@@ -147,13 +147,16 @@ def analyze(equity=20.0, top=5, taker_fee=0.00045, min_oi=1_000_000):
             card["range_pos"] = round(c48["range_pos"] * 100, 0)
         # sizing at 3x/5x/10x
         sizes = {}
+        dir_mult = 1 if best["direction"] == "LONG" else -1
         for lev in (3, 5, 10):
             notional = equity * lev
             fees = 2 * notional * taker_fee
             liq_move = 0.925 / lev
             stop = (best["mark"] * (1 + liq_move) if best["direction"] == "SHORT"
                     else best["mark"] * (1 - liq_move))
-            f12 = notional * (fh.get("avg", 0) / 2) * 12
+            # carry: you RECEIVE funding when your side is opposite the sign
+            # (positive funding -> shorts receive; negative -> longs receive)
+            f12 = -dir_mult * notional * (fh.get("avg", 0) / 2) * 12
             conv = notional * (abs(best.get("premium") or 0) / 2)
             sizes[f"{lev}x"] = {
                 "notional": round(notional, 2), "fees_rt": round(fees, 3),
