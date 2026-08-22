@@ -47,3 +47,5 @@ secrets/
 .vscode/
 *.sublime-project
 *.sublime-workspace
+
+.hl_secret
