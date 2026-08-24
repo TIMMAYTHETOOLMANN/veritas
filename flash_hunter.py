@@ -46,9 +46,11 @@ BROADCAST_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
-SCAN_INTERVAL_SEC = 60
+SCAN_INTERVAL_SEC = 180   # cross-venue quoter scan is ~1-2 min
 HEARTBEAT_EVERY_SEC = 15 * 60
 GAS_MULTIPLIER = 20
+EXECUTOR_V2_FILE = os.path.join(HERE, ".executor_v2_address")
+V3_ROUTER = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
 
 
 class Rpc:
@@ -130,6 +132,10 @@ def kec_sig(sig):
 
 
 def load_executor():
+    # prefer the cross-venue V2 executor when deployed
+    if os.path.isfile(EXECUTOR_V2_FILE):
+        with open(EXECUTOR_V2_FILE) as f:
+            return f.read().strip()
     if not os.path.isfile(EXECUTOR_FILE):
         return None
     with open(EXECUTOR_FILE) as f:
@@ -178,62 +184,113 @@ def gas_usd_of(gas_price_wei, gas_used, eth_usd=2450.0):
 
 
 def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
-    """One hunt cycle: scan -> sim candidates -> broadcast if gate passes."""
+    """One hunt cycle: cross-venue scan -> sim candidates -> broadcast if gate passes."""
     from core.rpc import RPC as Vrpc
+    import v3_layer
     r = Vrpc(rpc_scan, timeout=30, retries=3)
-    result = arb_engine.scan_once(r)
-    edges = result.get("edges", [])
+    # ETH price + gas from the V3 quoter itself (ground truth)
+    out = v3_layer.quote_v3(r, v3_layer.WETH, v3_layer.USDC, 10**18, 500,
+                            acct.address)
+    if not out:
+        print(f"[{time.strftime('%H:%M:%S')}] no quoter response — skipping cycle", flush=True)
+        return None
+    eth_usd = out / 1e6
+    gas_wei = uint_or_zero(r.call("eth_gasPrice", []))
+    gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
+    edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd)
     if verbose:
-        print(f"[{time.strftime('%H:%M:%S')}] scan: {len(result.get('pools', []))} pools, "
-              f"{result.get('pairs_scanned', 0)} pairs, {len(edges)} edges", flush=True)
-    log_event({"event": "scan", "pools": len(result.get("pools", [])),
-               "edges": len(edges), "head": result.get("chain_head")})
+        print(f"[{time.strftime('%H:%M:%S')}] cross-scan: {len(report)} combos, "
+              f"{len(edges)} edges (ETH ${eth_usd:.0f})", flush=True)
+    log_event({"event": "scan", "mode": "cross_venue",
+               "combos": len(report), "edges": len(edges),
+               "eth_usd": round(eth_usd, 2)})
     if not edges:
         return None
     for edge in edges:
-        # map scanner direction to executor pools
-        # direction string: "venue_a -> venue_b" (buy on a, sell on b)
-        # executor: poolBuy = venue_a (WETH->quote), poolSell = venue_b
-        pools = {p["name"]: p["address"] for p in result["pools"]}
-        pool_buy = pools.get(edge["venue_a"])
-        pool_sell = pools.get(edge["venue_b"])
-        if not pool_buy or not pool_sell:
-            continue
-        quote = arb_engine.USDC if edge["pair"].endswith("USDC") else arb_engine.USDCE
         sim_input = {
             "size_weth": edge["size_weth"],
-            "pool_buy": pool_buy,
-            "pool_sell": pool_sell,
-            "quote": quote,
-            "eth_usd": result["eth_usd"],
+            "buy_kind": edge["buy_kind"], "buy_venue": edge["buy_venue"],
+            "buy_fee": edge["buy_fee"],
+            "sell_kind": edge["sell_kind"], "sell_venue": edge["sell_venue"],
+            "sell_fee": edge["sell_fee"],
+            "quote": edge["quote"],
+            "eth_usd": eth_usd,
         }
-        print(f"[hunter] edge found -> simulating: {edge}", flush=True)
-        sim = simulate_edge(sim_input, w3=None, acct=acct,
-                            executor_addr=executor_addr)
+        print(f"[hunter] EDGE -> simulating: {edge}", flush=True)
+        sim = simulate_edge_v2(sim_input, acct, executor_addr)
         log_event({"event": "sim", "edge": edge, "sim": sim})
         if sim and sim.get("gate") == "PASS":
             print(f"[hunter] SIM PASS -> broadcasting: {sim}", flush=True)
-            receipt = broadcast_and_verify(rpc, acct, executor_addr, sim_input)
+            receipt = broadcast_and_verify_v2(rpc, acct, executor_addr, sim_input)
             log_event({"event": "broadcast", "receipt": receipt})
             return receipt
     return None
 
 
-def broadcast_and_verify(rpc, acct, executor_addr, plan):
-    """Sign + broadcast execute() to the real chain, then verify profit."""
-    nonce = rpc.nonce(acct.address)
-    data = (kec_sig("execute(uint256,address,address,address)")
+def uint_or_zero(x):
+    try:
+        return int(x, 16) if isinstance(x, str) else (x or 0)
+    except Exception:
+        return 0
+
+
+def encode_execute_v2(plan):
+    """Calldata for FlashloanArbV2.execute(uint256, Leg, Leg, address).
+    Leg = (uint8 kind, address venue, uint24 fee)."""
+    sel = kec_sig("execute(uint256,(uint8,address,uint24),(uint8,address,uint24),address)")
+    def leg(kind, venue, fee):
+        return f"{int(kind):064x}" + venue[2:].rjust(64, "0") + f"{int(fee):064x}"
+    return ("0x" + sel
             + f"{int(plan['size_weth']*1e18):064x}"
-            + plan["pool_buy"][2:].rjust(64, "0")
-            + plan["pool_sell"][2:].rjust(64, "0")
+            + leg(plan["buy_kind"], plan["buy_venue"], plan["buy_fee"])
+            + leg(plan["sell_kind"], plan["sell_venue"], plan["sell_fee"])
             + plan["quote"][2:].rjust(64, "0"))
+
+
+def simulate_edge_v2(edge, acct, executor_addr):
+    """Fork-sim the exact cross-venue live tx (anvil fork, real pools)."""
+    proc, host, head, fork_url = sim_gate.launch_fork()
+    try:
+        fork = sim_gate.Fork(host)
+        fork.set_balance(HOT_WALLET, 10 ** 18)
+        fork.impersonate(HOT_WALLET)
+        data = encode_execute_v2(edge)
+        weth_before = fork.erc20_balance(sim_gate.WETH, executor_addr)
+        try:
+            txh = fork.send_from(HOT_WALLET, executor_addr, data)
+            r = fork.wait_tx(txh)
+        except Exception as e:
+            return {"sim": "reverted", "error": str(e)[:200]}
+        if r.get("status") != "0x1":
+            return {"sim": "reverted"}
+        gas_used = int(r["gasUsed"], 16)
+        profit_weth = (fork.erc20_balance(sim_gate.WETH, executor_addr)
+                       - weth_before) / 1e18
+        profit_usd = profit_weth * edge.get("eth_usd", 2450)
+        gas_usd = (gas_used / 1e9) * (fork.gas_price() / 1e9) * edge.get("eth_usd", 2450)
+        return {
+            "sim": "ok", "gas_used": gas_used,
+            "profit_weth": round(profit_weth, 8),
+            "gas_usd": round(gas_usd, 4),
+            "profit_usd": round(profit_usd, 4),
+            "gate": "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
+                               and profit_usd > sim_gate.MIN_PROFIT_USD) else "FAIL",
+        }
+    finally:
+        sim_gate.kill_tree(proc)
+
+
+def broadcast_and_verify_v2(rpc, acct, executor_addr, plan):
+    """Sign + broadcast cross-venue execute() and verify on-chain."""
+    nonce = rpc.nonce(acct.address)
+    data = encode_execute_v2(plan)
     tx = {
         "from": acct.address,
         "to": executor_addr,
         "data": data,
         "nonce": nonce,
-        "gas": 600_000,
-        "gasPrice": int(rpc.gas_price() * 1.25),  # buffer over base fee
+        "gas": 900_000,
+        "gasPrice": int(rpc.gas_price() * 1.25),
         "chainId": 42161,
         "value": 0,
     }
@@ -242,13 +299,12 @@ def broadcast_and_verify(rpc, acct, executor_addr, plan):
                else signed.rawTransaction).hex()
     if not raw_hex.startswith("0x"):
         raw_hex = "0x" + raw_hex
-    raw = raw_hex
     txhash = None
     last_err = None
     for url in BROADCAST_RPCS:
         try:
             r = Rpc(url)
-            txhash = r.send_raw(raw)
+            txhash = r.send_raw(raw_hex)
             print(f"[hunter] broadcast via {url}: {txhash}")
             break
         except Exception as e:

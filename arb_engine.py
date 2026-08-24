@@ -152,7 +152,117 @@ def best_two_pool_arb(pool_a, pool_b, base, quote, ref_price):
     return best
 
 
-# ---- scan ----------------------------------------------------------------
+# ---- cross-venue scan (V2 x V3 via QuoterV2 executable quotes) -----------
+
+def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12):
+    """V3 <-> V3 and V3 <-> V2 edges for WETH/USDC and WETH/USDC.e.
+
+    Uses the QuoterV2 layer (executable out-amounts, real tick state) for
+    V3 legs and pool reserves for V2 legs. Numeric size scan finds the
+    profit-maximizing size; cost stack = both fees (in quotes) + Aave
+    premium + gas + safety margin.
+    """
+    import v3_layer
+
+    v2_pools = discover_pools(rpc)  # Sushi + UniV2 census (has real liq)
+    v3_census = [p for p in v3_layer.census_v3(rpc) if p["live"]
+                 and p["liquidity"] >= v3_layer.MIN_POOL_LIQUIDITY]
+
+    from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
+    edges = []
+    report = []
+
+    for quote in (USDC, USDCE):
+        qsym = "USDC" if quote == USDC else "USDC.e"
+        # venue list: (name, kind, addr, fee) — kind 0 = V2 pair, 1 = V3
+        venues = []
+        for p in v3_census:
+            if p["quote"] == quote:
+                venues.append((f"V3 {p['fee']/10000:.2f}%", 1, p["pool"], p["fee"]))
+        for p in v2_pools:
+            if p["quote"] == quote:
+                venues.append((p["name"], 0, p["address"], 0))
+
+        if len(venues) < 2:
+            continue
+
+        for i in range(len(venues)):
+            for j in range(len(venues)):
+                if i == j:
+                    continue
+                buy = venues[i]   # WETH -> quote
+                sell = venues[j]  # quote -> WETH
+                best = None
+                hi = 3.0  # WETH
+                for k in range(size_steps):
+                    size = hi * k / (size_steps - 1.0)
+                    if size <= 0:
+                        continue
+                    amt = int(size * 1e18)
+                    if buy[1] == 1:
+                        mid = v3_layer.quote_v3(rpc, WETH, quote, amt,
+                                                buy[3], from_addr)
+                    else:
+                        mid = v2_quote_out(rpc, buy[2], WETH, quote, amt)
+                    if not mid:
+                        continue
+                    if sell[1] == 1:
+                        back = v3_layer.quote_v3(rpc, quote, WETH, mid,
+                                                 sell[3], from_addr)
+                    else:
+                        back = v2_quote_out(rpc, sell[2], quote, WETH, mid)
+                    if not back:
+                        continue
+                    profit_weth = (back - amt) / 1e18
+                    if profit_weth > 0 and (best is None
+                                            or profit_weth > best[2]):
+                        best = (size, mid, profit_weth)
+                row = {"pair": f"WETH/{qsym}", "venue_buy": buy[0],
+                       "venue_sell": sell[0]}
+                if best:
+                    size, mid, profit = best
+                    loan_fee_usd = size * eth_usd * AAVE_FLASH_FEE
+                    net = profit * eth_usd - gas_usd - loan_fee_usd
+                    row.update({
+                        "size_weth": round(size, 6),
+                        "gross_usd": round(profit * eth_usd, 4),
+                        "loan_fee_usd": round(loan_fee_usd, 4),
+                        "gas_usd": round(gas_usd, 4),
+                        "net_usd": round(net, 4),
+                        # executor leg specs (kind, venue, fee)
+                        "buy_kind": buy[1], "buy_venue": buy[2], "buy_fee": buy[3],
+                        "sell_kind": sell[1], "sell_venue": sell[2], "sell_fee": sell[3],
+                        "quote": quote,
+                    })
+                    if net > SAFETY_MARGIN_USD:
+                        row["edge"] = True
+                        edges.append(row)
+                report.append(row)
+
+    return edges, report
+
+
+def v2_quote_out(rpc, pair, token_in, token_out, amount_in):
+    """Exact V2 out via live reserves. Returns raw int or None."""
+    tok0_sel = SEL["token0"]
+    if not tok0_sel.startswith("0x"):
+        tok0_sel = "0x" + tok0_sel
+    res_sel = SEL["reserves"]
+    if not res_sel.startswith("0x"):
+        res_sel = "0x" + res_sel
+    t0 = parse_addr(rpc.eth_call(pair, tok0_sel))
+
+    r0, r1 = parse_reserves(rpc.eth_call(pair, res_sel))
+    if t0 is None or r0 is None:
+        return None
+    dec_in = TOKENS[token_in]["decimals"]
+    dec_out = TOKENS[token_out]["decimals"]
+    in_h = amount_in / 10 ** dec_in
+    if t0.lower() == token_in.lower():
+        out_h = cp_out(r0 / 10 ** dec_in, r1 / 10 ** dec_out, in_h)
+    else:
+        out_h = cp_out(r1 / 10 ** dec_in, r0 / 10 ** dec_out, in_h)
+    return int(out_h * 10 ** dec_out)
 
 # Token universe for pair census. Every address is verified on-chain at scan
 # time (code + decimals); anything misremembered or dead simply drops out.
