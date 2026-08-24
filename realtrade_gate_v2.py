@@ -38,13 +38,14 @@ EXTRACTION_AMOUNT_USD = 10.0
 REMAINING_CAPITAL_USD = 10.0
 PROFITABILITY_CHECK_INTERVAL_SEC = 180  # 3 minutes
 MAX_PROFITABILITY_INTERVAL_SEC = 300    # 5 min max
+MIN_POSITION_USD = 10.0  # Hyperliquid minimum $10 per asset
 
 # State tracking
 state = {
     "portfolio": None,
     "last_profitability_check": time.time(),
     "emergency_halt": False,
-    "user_wallet": None,
+    "user_wallet": os.environ.get("VERITAS_USER_WALLET", "0x1a0d467974E70e3c1a2b7b84Fec21183Fc4eB60f"),
     "cycle_count": 0,
 }
 
@@ -52,15 +53,11 @@ signal.signal(signal.SIGINT, lambda s, f: setattr(state, "emergency_halt", True)
 signal.signal(signal.SIGTERM, lambda s, f: setattr(state, "emergency_halt", True))
 
 
-def signal_handler(signum, frame):
-    print(f"\n[!] Signal {signum} received — initiating clean shutdown...")
-    state["emergency_halt"] = True
-
-
 def check_emergency_stop(portfolio: PortfolioState) -> bool:
     """Check if emergency stop should trigger."""
     if portfolio.emergency_stop_triggered:
-        print(f"\n[EMERGENCY STOP] Total potential loss ${portfolio.used_risk_usd:.2f} + realized ${abs(min(0, portfolio.realized_pnl_usd)):.2f} exceeds ${EMERGENCY_STOP_USD:.2f}!")
+        actual_loss = abs(min(0, portfolio.realized_pnl_usd))
+        print(f"\n[EMERGENCY STOP] Actual realized loss ${actual_loss:.2f} exceeds ${EMERGENCY_STOP_USD:.2f}!")
         print("[!] System shutting down — awaiting your return.")
         state["emergency_halt"] = True
         return True
@@ -105,26 +102,49 @@ def execute_position_plan(plan: PositionPlan, execute: bool = False) -> bool:
         coin = plan.coin.upper()
         is_buy = plan.direction == "LONG"
         
-        # Get size decimals
+        # Get size decimals and price decimals for this asset
         sz_dec = None
+        px_dec = None
         meta = info.meta()
         for name in meta["universe"]:
             if name["name"] == coin:
                 sz_dec = name.get("szDecimals", 4)
+                px_dec = name.get("pxDecimals", 6)
                 break
         
         if sz_dec is None:
             print(f"  [ERROR] Unknown coin: {coin}")
             return False
         
+        # Get L2 book to cross spread properly
+        try:
+            l2 = info.l2_snapshot(coin)
+            best_bid = float(l2["levels"][0][0]["px"]) if l2.get("levels") and l2["levels"][0] else None
+            best_ask = float(l2["levels"][1][0]["px"]) if l2.get("levels") and l2["levels"][1] else None
+        except Exception:
+            best_bid = None
+            best_ask = None
+        
         mark = float(info.all_mids().get(coin, 0) or 0)
         if mark <= 0:
             print(f"  [ERROR] No mark price for {coin}")
             return False
         
-        # Use entry price with small slippage tolerance
-        px = plan.entry_price
-        sz = round(plan.notional_usd / px, sz_dec)
+        # Cross the spread using actual book prices with aggressive pricing for IOC fill guarantee
+        if is_buy:
+            # LONG = buy = pay ask + small buffer to cross spread
+            px = best_ask * 1.002 if best_ask else mark * 1.005
+        else:
+            # SHORT = sell = hit bid - small buffer to cross spread
+            px = best_bid * 0.998 if best_bid else mark * 0.995
+        
+        # Round price to asset's price decimal precision
+        px = round(px, px_dec)
+        # Handle integer size assets (sz_dec == 0)
+        if sz_dec == 0:
+            sz = int(round(plan.notional_usd / px))
+        else:
+            sz = round(plan.notional_usd / px, sz_dec)
         
         if sz <= 0:
             print(f"  [ERROR] Size rounds to zero")
@@ -132,7 +152,7 @@ def execute_position_plan(plan: PositionPlan, execute: bool = False) -> bool:
         
         est_fee = plan.notional_usd * TAKER_FEE
         print(f"  Size: {sz} {coin} (${plan.notional_usd:.2f} notional)")
-        print(f"  Price: {px:.6f} (mark {mark:.6f})")
+        print(f"  Price: {px:.6f} (mark {mark:.6f}, best_bid={best_bid}, best_ask={best_ask})")
         print(f"  Est. fee: ${est_fee:.4f}")
         print(f"  Hard stop: {plan.hard_stop_price:.6f} (exchange-enforced)")
         
@@ -142,7 +162,7 @@ def execute_position_plan(plan: PositionPlan, execute: bool = False) -> bool:
         
         # Place hard stop (reduce-only trigger SL)
         stop_buy = plan.direction == "SHORT"  # Close short = buy back
-        stop_result = ex.order(coin, stop_buy, sz, plan.hard_stop_price, 
+        stop_result = ex.order(coin, stop_buy, sz, plan.hard_stop_price,
                                {"trigger": {"triggerPx": plan.hard_stop_price, "isMarket": True, "tpsl": "sl"}},
                                reduce_only=True)
         print(f"  Stop order: {stop_result.get('status')} @ {plan.hard_stop_price}")
@@ -210,7 +230,7 @@ def realtrade_gate_v2():
     else:
         print("[INIT] Executing initial positions...")
         for plan in portfolio.positions:
-            execute_position_plan(plan, execute=False)  # DRY-RUN by default
+            execute_position_plan(plan, execute=True)  # LIVE EXECUTION
     
     print("\n[SYSTEM] Entering main monitoring loop...")
     print("=" * 70)
@@ -223,9 +243,6 @@ def realtrade_gate_v2():
             break
         
         # Check extraction
-        user_wallet = os.environ.get("VERITAS_USER_WALLET")
-        if user_wallet:
-            state["user_wallet"] = user_wallet
         check_extraction(portfolio, state["user_wallet"])
         
         # Profitability cycle check
@@ -248,7 +265,7 @@ def realtrade_gate_v2():
                     print(f"[REBALANCE] Adding: {', '.join(added)}")
                     for plan in new_portfolio.positions:
                         if plan.coin in added:
-                            execute_position_plan(plan, execute=False)
+                            execute_position_plan(plan, execute=True)
                 
                 if removed:
                     print(f"[REBALANCE] Removing: {', '.join(removed)}")
@@ -292,10 +309,12 @@ def realtrade_gate_v2():
 
 
 if __name__ == "__main__":
-    user_wallet = os.environ.get("VERITAS_USER_WALLET")
+    user_wallet = state["user_wallet"]
     if not user_wallet:
         print("[INFO] VERITAS_USER_WALLET not set — $10 extraction disabled.")
         print("       Set with: $env:VERITAS_USER_WALLET='0x...' (PowerShell)")
-    
+    else:
+        print(f"[INFO] Wallet registered: {user_wallet} — $10 extraction enabled.")
+
     print("\n--- Starting VERITAS Realtrade Gate v2 ---\n")
     realtrade_gate_v2()

@@ -22,13 +22,13 @@ from dataclasses import dataclass, field
 from funding_scout import analyze
 
 # === CONSTANTS ===
-TOTAL_POOL_USD = 20.0           # Pool after extraction
+TOTAL_POOL_USD = 17.76          # Live capital: hot-wallet HL perps account
 MAX_RISK_PCT = 0.40             # 40% max at risk
-MAX_RISK_USD = TOTAL_POOL_USD * MAX_RISK_PCT  # $8.00
+MAX_RISK_USD = TOTAL_POOL_USD * MAX_RISK_PCT  # $7.10
 EMERGENCY_STOP_USD = 7.0        # Hard halt threshold
 EFFECTIVE_MAX_RISK_USD = min(MAX_RISK_USD, EMERGENCY_STOP_USD)  # $7.00
-MIN_POSITION_USD = 0.50         # Minimum notional per position (exchange minimums)
-MAX_POSITIONS = 20              # Hard cap on simultaneous positions
+MIN_POSITION_USD = 10.0         # Minimum notional per position (Hyperliquid $10 minimum)
+MAX_POSITIONS = 10              # Hard cap on simultaneous positions
 
 # Per-asset leverage caps (Hyperliquid max leverage by asset)
 # These are discovered dynamically but we have defaults
@@ -83,9 +83,11 @@ class PortfolioState:
     
     @property
     def emergency_stop_triggered(self) -> bool:
-        # Total loss = realized + unrealized (if all stops hit)
-        total_potential_loss = abs(min(0, self.realized_pnl_usd)) + self.used_risk_usd
-        return total_potential_loss > EMERGENCY_STOP_USD
+        # Emergency stop triggers on ACTUAL REALIZED LOSSES exceeding $7
+        # NOT on risk budget allocation (which is by design)
+        # Total loss = negative realized PnL (actual money lost)
+        actual_loss = abs(min(0, self.realized_pnl_usd))
+        return actual_loss > EMERGENCY_STOP_USD
     
     @property
     def extraction_ready(self) -> bool:

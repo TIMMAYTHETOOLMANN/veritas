@@ -49,3 +49,4 @@ secrets/
 *.sublime-workspace
 
 .hl_secret
+.hot_secret
