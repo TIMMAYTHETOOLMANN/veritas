@@ -50,3 +50,8 @@ secrets/
 
 .hl_secret
 .hot_secret
+
+# runtime + secrets
+burner_wallet_bundle.json
+flash_hunter_run.out
+*.out
