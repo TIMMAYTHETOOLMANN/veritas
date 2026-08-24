@@ -179,10 +179,13 @@ contract FlashloanArbV2 {
         // ---- repay Aave: principal + premium (APPROVE, not transfer) --
         uint256 repay = amount + premium;
         uint256 wethFinal = IERC20(WETH).balanceOf(address(this));
-        require(wethFinal >= repay, "insufficient WETH to repay");
+        // Preserve any WETH the executor already held (prior profit) and
+        // ensure the new post-trade balance can cover repayment.
+        require(wethFinal >= wethBefore + repay, "insufficient WETH to repay");
         IERC20(WETH).approve(address(aavePool), repay);
 
-        uint256 profit = IERC20(WETH).balanceOf(address(this)) - wethBefore;
+        // Net profit is what remains after preserving prior balance and repaying.
+        uint256 profit = wethFinal - wethBefore - repay;
         if (profit == 0) revert NoProfit();
         emit ArbExecuted(profit, amount, buyLeg.kind, sellLeg.kind);
         return true;

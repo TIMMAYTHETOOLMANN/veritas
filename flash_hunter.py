@@ -2,22 +2,17 @@
 """
 flash_hunter.py — VERITAS Engine: autonomous Arbitrum flash-loan arb hunter.
 
-THE LOOP (user spec): scan → fork-sim → gate (profit > 20x gas) -> broadcast
--> verify on-chain profit -> log heartbeat. Deploy the executor once
-(~$0.03 gas), then every attempt costs only gas-if-included; a reverted
-attempt costs ~$0.005. The $15.70 principal is NEVER exposed — the
-flashloan carries the size; atomicity guarantees revert-on-failure.
+THE LOOP: scan (registry cross-venue) → fork-sim → gate → broadcast
+→ verify on-chain profit → log heartbeat. Deploy the executor once,
+then every attempt costs only gas-if-included; a reverted attempt costs
+~$0.005. Principal is NEVER exposed — flashloan carries the size;
+atomicity guarantees revert-on-failure.
 
 SECURITY MODEL:
   - Key: hot wallet, read from .hot_secret at runtime. Never printed.
   - Signing happens ONLY after the fork-sim gate PASSES. No gate, no tx.
   - Broadcast is retried across 3 public RPCs (rotation).
   - Every cycle logs to flash_hunter.log (JSONL) + heartbeat every 15 min.
-
-Usage:
-  python3 flash_hunter.py --deploy        # deploy executor once (~$0.03)
-  python3 flash_hunter.py --run           # hunt forever (default 60s cycles)
-  python3 flash_hunter.py --status        # executor address + WETH balance
 """
 import argparse
 import json
@@ -36,6 +31,7 @@ import sim_gate
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "flash_hunter.log")
 EXECUTOR_FILE = os.path.join(HERE, ".executor_address")
+EXECUTOR_V2_FILE = os.path.join(HERE, ".executor_v2_address")
 
 HOT_WALLET = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
 SECRET_FILE = os.path.join(HERE, ".hot_secret")
@@ -46,11 +42,12 @@ BROADCAST_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
-SCAN_INTERVAL_SEC = 180   # cross-venue quoter scan is ~1-2 min
+SCAN_INTERVAL_SEC = 180      # cross-venue quoter scan is ~2 min
 HEARTBEAT_EVERY_SEC = 15 * 60
-GAS_MULTIPLIER = 20
-EXECUTOR_V2_FILE = os.path.join(HERE, ".executor_v2_address")
+GAS_MULTIPLIER = 3           # smaller = more trades on smaller edges
+MIN_PROFIT_USD = 0.10        # allow sub-$0.50 edges (gas is ~$0.02)
 V3_ROUTER = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+SWEEP_THRESHOLD_WETH = 0.001  # auto-sweep profit above this to hot wallet
 
 
 class Rpc:
@@ -85,8 +82,7 @@ class Rpc:
         return int(self.req("eth_getBalance", [addr, "latest"]), 16)
 
     def nonce(self, addr):
-        return int(self.req("eth_getTransactionCount",
-                            [addr, "latest"]), 16)
+        return int(self.req("eth_getTransactionCount", [addr, "latest"]), 16)
 
     def gas_price(self):
         return int(self.req("eth_gasPrice", []), 16)
@@ -142,20 +138,21 @@ def load_executor():
         return f.read().strip()
 
 
-def deploy_executor(rpc, acct):
-    with open(os.path.join(HERE, "contracts", "FlashloanArb.bin")) as f:
+def deploy_executor_v2(rpc, acct):
+    """Deploy the cross-venue V2+V3 executor (FlashloanArbV2)."""
+    with open(os.path.join(HERE, "contracts", "FlashloanArbV2.bin")) as f:
         binhex = f.read().strip()
     nonce = rpc.nonce(acct.address)
-    gas_price = int(rpc.gas_price() * 1.25)  # buffer over base fee
-    # constructor args: aavePool, weth (encoded, appended to init code)
+    gas_price = int(rpc.gas_price() * 1.25)
     ctor = (binhex
             + arb_engine.AAVE_V3_POOL[2:].rjust(64, "0")
+            + V3_ROUTER[2:].rjust(64, "0")
             + arb_engine.WETH[2:].rjust(64, "0"))
     tx = {
         "from": acct.address,
         "data": "0x" + ctor if not binhex.startswith("0x") else ctor,
         "nonce": nonce,
-        "gas": 2_000_000,
+        "gas": 2_500_000,
         "gasPrice": gas_price,
         "chainId": 42161,
         "value": 0,
@@ -168,13 +165,13 @@ def deploy_executor(rpc, acct):
     h = rpc.send_raw(raw_hex)
     r = rpc.wait_receipt(h)
     if int(r["status"], 16) != 1:
-        raise RuntimeError("executor deployment failed: " + json.dumps(r)[:300])
+        raise RuntimeError("executor v2 deployment failed: " + json.dumps(r)[:300])
     addr = r["contractAddress"]
-    with open(EXECUTOR_FILE, "w") as f:
+    with open(EXECUTOR_V2_FILE, "w") as f:
         f.write(addr)
-    log_event({"event": "executor_deployed", "address": addr,
+    log_event({"event": "executor_v2_deployed", "address": addr,
                "gas_used": int(r["gasUsed"], 16), "tx": h})
-    print(f"[hunter] executor deployed: {addr} "
+    print(f"[hunter] executor V2 deployed: {addr} "
           f"(gas {int(r['gasUsed'], 16):,})")
     return addr
 
@@ -184,7 +181,7 @@ def gas_usd_of(gas_price_wei, gas_used, eth_usd=2450.0):
 
 
 def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
-    """One hunt cycle: cross-venue scan -> sim candidates -> broadcast if gate passes."""
+    """One hunt cycle: registry cross-venue scan -> sim candidates -> broadcast if gate passes."""
     from core.rpc import RPC as Vrpc
     import v3_layer
     r = Vrpc(rpc_scan, timeout=30, retries=3)
@@ -197,7 +194,14 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
     eth_usd = out / 1e6
     gas_wei = uint_or_zero(r.call("eth_gasPrice", []))
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
-    edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd)
+    try:
+        edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
+                                                     size_steps=8,
+                                                     max_venues_per_quote=4)
+    except Exception as e:
+        print(f"[hunter] registry scan failed: {e}", flush=True)
+        log_event({"event": "scan_error", "error": str(e)[:200]})
+        return None
     if verbose:
         print(f"[{time.strftime('%H:%M:%S')}] cross-scan: {len(report)} combos, "
               f"{len(edges)} edges (ETH ${eth_usd:.0f})", flush=True)
@@ -240,7 +244,7 @@ def encode_execute_v2(plan):
     sel = kec_sig("execute(uint256,(uint8,address,uint24),(uint8,address,uint24),address)")
     def leg(kind, venue, fee):
         return f"{int(kind):064x}" + venue[2:].rjust(64, "0") + f"{int(fee):064x}"
-    return ("0x" + sel
+    return (sel
             + f"{int(plan['size_weth']*1e18):064x}"
             + leg(plan["buy_kind"], plan["buy_venue"], plan["buy_fee"])
             + leg(plan["sell_kind"], plan["sell_venue"], plan["sell_fee"])
@@ -268,13 +272,14 @@ def simulate_edge_v2(edge, acct, executor_addr):
                        - weth_before) / 1e18
         profit_usd = profit_weth * edge.get("eth_usd", 2450)
         gas_usd = (gas_used / 1e9) * (fork.gas_price() / 1e9) * edge.get("eth_usd", 2450)
+        gate = "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
+                          and profit_usd > MIN_PROFIT_USD) else "FAIL"
         return {
             "sim": "ok", "gas_used": gas_used,
             "profit_weth": round(profit_weth, 8),
             "gas_usd": round(gas_usd, 4),
             "profit_usd": round(profit_usd, 4),
-            "gate": "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
-                               and profit_usd > sim_gate.MIN_PROFIT_USD) else "FAIL",
+            "gate": gate,
         }
     finally:
         sim_gate.kill_tree(proc)
@@ -321,49 +326,55 @@ def broadcast_and_verify_v2(rpc, acct, executor_addr, plan):
     }
 
 
-def simulate_edge(edge, w3, acct, executor_addr):
-    """Fork-sim the exact live tx (re-used sim_gate harness)."""
-    proc, host, head, fork_url = sim_gate.launch_fork()
-    try:
-        fork = sim_gate.Fork(host)
-        # owner of the deployed contract is the hot wallet — impersonate it
-        fork.set_balance(HOT_WALLET, 10 ** 18)
-        fork.impersonate(HOT_WALLET)
-        principal = int(edge["size_weth"] * 1e18)
-        data = ("0x" + kec_sig("execute(uint256,address,address,address)")
-                + f"{principal:064x}"
-                + edge["pool_buy"][2:].rjust(64, "0")
-                + edge["pool_sell"][2:].rjust(64, "0")
-                + edge["quote"][2:].rjust(64, "0"))
-        weth_before = fork.erc20_balance(sim_gate.WETH, executor_addr)
+def sweep_executor_v2(rpc, acct, executor_addr):
+    """Sweep accumulated WETH profit from executor to hot wallet."""
+    bal = call_weth_balance(rpc, executor_addr)
+    if bal < int(SWEEP_THRESHOLD_WETH * 1e18):
+        return None
+    data = "0x" + kec_sig("sweepProfit(address)") + arb_engine.WETH[2:].rjust(64, "0")
+    nonce = rpc.nonce(acct.address)
+    tx = {
+        "from": acct.address,
+        "to": executor_addr,
+        "data": data,
+        "nonce": nonce,
+        "gas": 200_000,
+        "gasPrice": int(rpc.gas_price() * 1.25),
+        "chainId": 42161,
+        "value": 0,
+    }
+    signed = acct.sign_transaction(tx)
+    raw_hex = (signed.raw_transaction if hasattr(signed, "raw_transaction")
+               else signed.rawTransaction).hex()
+    if not raw_hex.startswith("0x"):
+        raw_hex = "0x" + raw_hex
+    txhash = None
+    for url in BROADCAST_RPCS:
         try:
-            txh = fork.send_from(HOT_WALLET, executor_addr, data)
-            r = fork.wait_tx(txh)
+            r = Rpc(url)
+            txhash = r.send_raw(raw_hex)
+            print(f"[hunter] sweep broadcast via {url}: {txhash}")
+            break
         except Exception as e:
-            return {"sim": "reverted", "error": str(e)[:200]}
-        if r.get("status") != "0x1":
-            return {"sim": "reverted"}
-        gas_used = int(r["gasUsed"], 16)
-        # profit = executor WETH DELTA (executor may hold prior profit)
-        profit_weth = (fork.erc20_balance(sim_gate.WETH, executor_addr)
-                       - weth_before) / 1e18
-        profit_usd = profit_weth * edge.get("eth_usd", 2450)
-        gas_usd = (gas_used / 1e9) * (fork.gas_price() / 1e9) * edge.get("eth_usd", 2450)
-        return {
-            "sim": "ok", "gas_used": gas_used,
-            "executor_weth_after": profit_weth,
-            "gas_usd": round(gas_usd, 4),
-            "profit_usd": round(profit_usd, 4),
-            "gate": "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
-                               and profit_usd > sim_gate.MIN_PROFIT_USD) else "FAIL",
-        }
-    finally:
-        sim_gate.kill_tree(proc)
+            print(f"[hunter] sweep failed via {url}: {e}")
+    if not txhash:
+        return {"sweep": "failed"}
+    rec = rpc.wait_receipt(txhash)
+    log_event({"event": "sweep", "tx": txhash, "weth_wei": bal,
+               "status": int(rec["status"], 16)})
+    return {"sweep": "ok", "tx": txhash, "weth": bal/1e18}
+
+
+def call_weth_balance(rpc, executor_addr):
+    data = "0x70a08231" + executor_addr[2:].rjust(64, "0")
+    raw = rpc.eth_call(arb_engine.WETH, data)
+    return int(raw, 16)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--deploy", action="store_true")
+    ap.add_argument("--deploy", action="store_true",
+                    help="deploy the cross-venue V2 executor")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--once", action="store_true",
                     help="single cycle then exit (for cron watchdog)")
@@ -377,8 +388,10 @@ def main():
           f"ETH {rpc.balance(acct.address)/1e18:.6f}")
 
     executor_addr = load_executor()
-    if args.deploy or (not executor_addr and not args.status):
-        executor_addr = deploy_executor(rpc, acct)
+    if args.deploy:
+        executor_addr = deploy_executor_v2(rpc, acct)
+    if not executor_addr and not args.status:
+        executor_addr = deploy_executor_v2(rpc, acct)
     if args.status:
         e = load_executor()
         if not e:
@@ -388,7 +401,7 @@ def main():
         print(f"[hunter] executor {e} holds {weth/1e18:.8f} WETH profit")
         return
 
-    # single-cycle mode: one hunt pass then exit (cron watchdog owns cadence)
+    # single-cycle mode: one hunt pass then exit
     if args.once:
         try:
             hunt_once(rpc, acct, executor_addr, BROADCAST_RPCS[0])
@@ -399,13 +412,18 @@ def main():
 
     # hunt loop
     print(f"[hunter] hunting. executor={executor_addr} "
-          f"interval={SCAN_INTERVAL_SEC}s gate=profit>{GAS_MULTIPLIER}x gas")
+          f"interval={SCAN_INTERVAL_SEC}s gate=profit>{GAS_MULTIPLIER}x gas "
+          f"min=${MIN_PROFIT_USD}")
     last_hb = 0.0
     cycle = 0
     while True:
         cycle += 1
         try:
             hunt_once(rpc, acct, executor_addr, BROADCAST_RPCS[0])
+            try:
+                sweep_executor_v2(rpc, acct, executor_addr)
+            except Exception as e:
+                print(f"[hunter] sweep error (non-fatal): {e}", flush=True)
         except Exception as e:
             print(f"[hunter] cycle error: {e}", flush=True)
             log_event({"event": "error", "cycle": cycle, "error": str(e)[:200]})
@@ -421,12 +439,6 @@ def main():
         except Exception as e:
             print(f"[hunter] heartbeat error (non-fatal): {e}", flush=True)
         time.sleep(SCAN_INTERVAL_SEC)
-
-
-def call_weth_balance(rpc, executor_addr):
-    data = "0x70a08231" + executor_addr[2:].rjust(64, "0")
-    raw = rpc.eth_call(arb_engine.WETH, data)
-    return int(raw, 16)
 
 
 if __name__ == "__main__":

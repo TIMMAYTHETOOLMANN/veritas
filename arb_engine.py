@@ -152,65 +152,147 @@ def best_two_pool_arb(pool_a, pool_b, base, quote, ref_price):
     return best
 
 
+# ---- token metadata (expanding beyond hard-coded universe) ----------------
+
+_decimals_cache = {}
+
+
+def token_decimals(rpc, addr):
+    addr = addr.lower()
+    if addr in _decimals_cache:
+        return _decimals_cache[addr]
+    if addr in TOKENS:
+        d = TOKENS[addr]["decimals"]
+        _decimals_cache[addr] = d
+        return d
+    try:
+        r = rpc.eth_call(addr, "0x313ce567")
+        d = int(r[2:66], 16) if r and len(r) >= 66 else None
+    except Exception:
+        d = None
+    if d is None:
+        d = 18
+    _decimals_cache[addr] = d
+    return d
+
+
+def token_symbol(addr):
+    return TOKENS.get(addr, {}).get("sym", addr[:8])
+
+
 # ---- cross-venue scan (V2 x V3 via QuoterV2 executable quotes) -----------
 
-def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12):
-    """V3 <-> V3 and V3 <-> V2 edges for WETH/USDC and WETH/USDC.e.
+def _load_registry_pools(rpc):
+    """Read registered pools from veritas.db. Returns (v3_census, v2_pools)."""
+    import sqlite3
+    DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "veritas.db")
+    conn = sqlite3.connect(DB, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    rows = conn.execute(
+        "SELECT pair_addr, venue, kind, token0, token1, fee_tier, "
+        "reserve0, reserve1, usd_depth FROM pools").fetchall()
+    conn.close()
 
-    Uses the QuoterV2 layer (executable out-amounts, real tick state) for
-    V3 legs and pool reserves for V2 legs. Numeric size scan finds the
-    profit-maximizing size; cost stack = both fees (in quotes) + Aave
-    premium + gas + safety margin.
-    """
+    v3 = []
+    v2 = []
+    for addr, venue, kind, t0, t1, fee, r0, r1, depth in rows:
+        t0l, t1l = t0.lower(), t1.lower()
+        if kind == "v3":
+            L = pool_liquidity(rpc, addr)
+            if L is None:
+                L = 0
+            # only keep WETH-paired V3 pools
+            if t0l != WETH and t1l != WETH:
+                continue
+            quote = t1l if t0l == WETH else t0l
+            v3.append({"pool": addr, "fee": fee, "quote": quote,
+                       "liquidity": L, "name": f"{venue} V3 {fee/10000:.2f}%"})
+        elif kind == "v2":
+            # only keep WETH-paired V2 pools with depth
+            if t0l == WETH:
+                base, quote, br, qr = t0l, t1l, r0, r1
+            elif t1l == WETH:
+                base, quote, br, qr = t1l, t0l, r1, r0
+            else:
+                continue
+            if not br or not qr:
+                continue
+            # sanity-filter absurd depth (decimal read errors)
+            depth = depth or 0
+            if depth > 1_000_000_000 or depth < 0:
+                continue
+            dec0 = token_decimals(rpc, t0l)
+            dec1 = token_decimals(rpc, t1l)
+            p = {
+                "name": f"{venue} WETH/{quote[:8]}",
+                "address": addr,
+                "token0": t0l, "token1": t1l,
+                "r0": int(br * 10 ** dec0),
+                "r1": int(qr * 10 ** dec1),
+                "quote": quote,
+                "weth_reserve": br,
+                "quote_reserve": qr,
+                "usd_depth": depth,
+            }
+            v2.append(p)
+    return v3, v2
+
+
+def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=10, max_venues_per_quote=4):
+    """V3 <-> V3 and V3 <-> V2 edges using the pool registry."""
     import v3_layer
 
-    v2_pools = discover_pools(rpc)  # Sushi + UniV2 census (has real liq)
-    v3_census = [p for p in v3_layer.census_v3(rpc) if p["live"]
-                 and p["liquidity"] >= v3_layer.MIN_POOL_LIQUIDITY]
+    v3_census_raw, v2_pools = _load_registry_pools(rpc)
+    v3_census = [p for p in v3_census_raw
+                 if p["liquidity"] >= v3_layer.MIN_POOL_LIQUIDITY]
 
     from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
     edges = []
     report = []
 
-    for quote in (USDC, USDCE):
-        qsym = "USDC" if quote == USDC else "USDC.e"
-        # venue list: (name, kind, addr, fee) — kind 0 = V2 pair, 1 = V3
-        venues = []
-        for p in v3_census:
-            if p["quote"] == quote:
-                venues.append((f"V3 {p['fee']/10000:.2f}%", 1, p["pool"], p["fee"]))
-        for p in v2_pools:
-            if p["quote"] == quote:
-                venues.append((p["name"], 0, p["address"], 0))
+    # group venues by quote token; keep deepest V2 + most liquid V3
+    quotes = {}
+    for p in v3_census:
+        quotes.setdefault(p["quote"], []).append(
+            (p["name"], 1, p["pool"], p["fee"], p["liquidity"]))
+    for p in v2_pools:
+        quotes.setdefault(p["quote"], []).append(
+            (p["name"], 0, p["address"], 0, p.get("usd_depth", 0)))
 
+    for quote, venues in quotes.items():
+        qsym = token_symbol(quote)
         if len(venues) < 2:
             continue
+        # sort by depth/liquidity descending, cap count
+        venues.sort(key=lambda x: x[4], reverse=True)
+        venues = venues[:max_venues_per_quote]
+        q_dec = token_decimals(rpc, quote)
 
         for i in range(len(venues)):
             for j in range(len(venues)):
                 if i == j:
                     continue
-                buy = venues[i]   # WETH -> quote
-                sell = venues[j]  # quote -> WETH
+                buy = venues[i]
+                sell = venues[j]
                 best = None
-                hi = 3.0  # WETH
-                for k in range(size_steps):
-                    size = hi * k / (size_steps - 1.0)
-                    if size <= 0:
-                        continue
+                hi = 2.0  # WETH; smaller = faster
+                for k in range(1, size_steps + 1):
+                    size = hi * k / size_steps
                     amt = int(size * 1e18)
                     if buy[1] == 1:
                         mid = v3_layer.quote_v3(rpc, WETH, quote, amt,
                                                 buy[3], from_addr)
                     else:
-                        mid = v2_quote_out(rpc, buy[2], WETH, quote, amt)
+                        mid = v2_quote_out(rpc, buy[2], WETH, quote, amt,
+                                           q_dec=q_dec)
                     if not mid:
                         continue
                     if sell[1] == 1:
                         back = v3_layer.quote_v3(rpc, quote, WETH, mid,
                                                  sell[3], from_addr)
                     else:
-                        back = v2_quote_out(rpc, sell[2], quote, WETH, mid)
+                        back = v2_quote_out(rpc, sell[2], quote, WETH, mid,
+                                            q_dec=q_dec)
                     if not back:
                         continue
                     profit_weth = (back - amt) / 1e18
@@ -229,7 +311,6 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12):
                         "loan_fee_usd": round(loan_fee_usd, 4),
                         "gas_usd": round(gas_usd, 4),
                         "net_usd": round(net, 4),
-                        # executor leg specs (kind, venue, fee)
                         "buy_kind": buy[1], "buy_venue": buy[2], "buy_fee": buy[3],
                         "sell_kind": sell[1], "sell_venue": sell[2], "sell_fee": sell[3],
                         "quote": quote,
@@ -242,7 +323,12 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12):
     return edges, report
 
 
-def v2_quote_out(rpc, pair, token_in, token_out, amount_in):
+def pool_liquidity(rpc, pool):
+    r = rpc.eth_call(pool, "0x1a686502")
+    return uint(r) or 0
+
+
+def v2_quote_out(rpc, pair, token_in, token_out, amount_in, q_dec=None):
     """Exact V2 out via live reserves. Returns raw int or None."""
     tok0_sel = SEL["token0"]
     if not tok0_sel.startswith("0x"):
@@ -251,12 +337,11 @@ def v2_quote_out(rpc, pair, token_in, token_out, amount_in):
     if not res_sel.startswith("0x"):
         res_sel = "0x" + res_sel
     t0 = parse_addr(rpc.eth_call(pair, tok0_sel))
-
     r0, r1 = parse_reserves(rpc.eth_call(pair, res_sel))
     if t0 is None or r0 is None:
         return None
-    dec_in = TOKENS[token_in]["decimals"]
-    dec_out = TOKENS[token_out]["decimals"]
+    dec_in = token_decimals(rpc, token_in)
+    dec_out = q_dec if q_dec is not None else token_decimals(rpc, token_out)
     in_h = amount_in / 10 ** dec_in
     if t0.lower() == token_in.lower():
         out_h = cp_out(r0 / 10 ** dec_in, r1 / 10 ** dec_out, in_h)

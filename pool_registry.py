@@ -119,20 +119,19 @@ def parse_addr(res):
 def upsert_pool(conn, pair, venue, kind, t0, t1, fee_tier=0,
                 r0=None, r1=None, depth=None):
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute("""INSERT INTO pools
-        (pair_addr, venue, kind, token0, token1, fee_tier,
-         reserve0, reserve1, usd_depth, first_seen, last_checked)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(pair_addr) DO UPDATE SET
-          venue=excluded.venue, kind=excluded.kind,
-          reserve0=COALESCE(excluded.reserve0, pools.reserve0),
-          reserve1=COALESCE(excluded.reserve1, pools.reserve1),
-          usd_depth=COALESCE(excluded.usd_depth, pools.usd_depth),
-          last_checked=excluded.last_checked""",
-                 (pair.lower(), venue, kind, t0.lower(), t1.lower(),
-                  fee_tier, r0, r1, depth, now, now))
-
-
+    with conn:  # auto-commit/rollback per upsert; short lock window
+        conn.execute("""INSERT INTO pools
+            (pair_addr, venue, kind, token0, token1, fee_tier,
+             reserve0, reserve1, usd_depth, first_seen, last_checked)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(pair_addr) DO UPDATE SET
+              venue=excluded.venue, kind=excluded.kind,
+              reserve0=COALESCE(excluded.reserve0, pools.reserve0),
+              reserve1=COALESCE(excluded.reserve1, pools.reserve1),
+              usd_depth=COALESCE(excluded.usd_depth, pools.usd_depth),
+              last_checked=excluded.last_checked""",
+                     (pair.lower(), venue, kind, t0.lower(), t1.lower(),
+                      fee_tier, r0, r1, depth, now, now))
 # ---- prong 1: curated hub --------------------------------------------------
 
 def scan_curated(rpc, conn):
@@ -157,6 +156,7 @@ def scan_curated(rpc, conn):
                 if pool:
                     upsert_pool(conn, pool, venue, "v2", token, hub, 0)
                     found += 1
+    # final checkpoint + commit
     _commit_retry(conn)
     return found
 
@@ -182,12 +182,13 @@ def token_decimals(rpc, addr, conn=None):
 
 
 def _save_progress(conn, name, next_idx):
-    conn.execute("""INSERT INTO census_progress (name, next_idx, updated)
-                    VALUES (?,?,?)
-                    ON CONFLICT(name) DO UPDATE SET
-                      next_idx=excluded.next_idx,
-                      updated=excluded.updated""",
-                 (name, next_idx, time.strftime("%Y-%m-%d %H:%M:%S")))
+    with conn:
+        conn.execute("""INSERT INTO census_progress (name, next_idx, updated)
+                        VALUES (?,?,?)
+                        ON CONFLICT(name) DO UPDATE SET
+                          next_idx=excluded.next_idx,
+                          updated=excluded.updated""",
+                     (name, next_idx, time.strftime("%Y-%m-%d %H:%M:%S")))
 
 
 def scan_camelot(rpc, conn, limit=0, min_depth=MIN_USD_DEPTH, eth_usd=2440.0,
@@ -242,7 +243,6 @@ def scan_camelot(rpc, conn, limit=0, min_depth=MIN_USD_DEPTH, eth_usd=2440.0,
             kept += 1
         if i % 50 == 0:
             _save_progress(conn, "camelot_census", i)
-            _commit_retry(conn)  # crash-resilient + short lock windows
             print(f"[camelot] progress {i:,}/{n:,} "
                   f"(hub-quoted={hub_quoted} kept={kept})", flush=True)
         if limit and kept >= limit:
@@ -283,14 +283,13 @@ def enrich(conn, rpc, eth_usd=2440.0):
             depth = 2 * d0 * eth_usd
         else:
             depth = 2 * d0
-        conn.execute("UPDATE pools SET reserve0=?, reserve1=?, usd_depth=?, "
-                     "last_checked=? WHERE pair_addr=?",
-                     (d0, d1, depth, time.strftime("%Y-%m-%d %H:%M:%S"), pair))
+        with conn:
+            conn.execute("UPDATE pools SET reserve0=?, reserve1=?, usd_depth=?, "
+                         "last_checked=? WHERE pair_addr=?",
+                         (d0, d1, depth, time.strftime("%Y-%m-%d %H:%M:%S"), pair))
         done += 1
         if done % 50 == 0:
-            _commit_retry(conn)
             print(f"[enrich] {done} pools with depth", flush=True)
-    _commit_retry(conn)
     return done, skipped
 
 
@@ -344,7 +343,6 @@ def scan_fresh(rpc, conn, blocks=100_000):
             found += 1
             print(f"[fresh] {venue} new pool {pool} "
                   f"{'0x'+t0[2:10]}../{'0x'+t1[2:10]}..")
-    _commit_retry(conn)
     return found
 
 
