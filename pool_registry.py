@@ -63,6 +63,10 @@ CURATED = {
 }
 
 MIN_USD_DEPTH = 2_000
+# Sanity cap: no single Sushi/UniV2/Camelot/Camelot-V3 pool on Arbitrum
+# holds > $100M. Anything above this is a parse/order bug or a scam pool
+# with fabricated reserves — clamp to 0 so it never feeds the edge math.
+MAX_SANE_POOL_USD = 100_000_000
 
 
 # ---- db -------------------------------------------------------------------
@@ -146,7 +150,12 @@ def scan_curated(rpc, conn):
                                  "0x1698ee82" + pad(token) + pad(hub) + f"{fee:064x}")
                 pool = parse_addr(r)
                 if pool:
-                    upsert_pool(conn, pool, "univ3", "v3", token, hub, fee)
+                    # store the pool's ACTUAL token0/token1 order —
+                    # depth math against raw reserves is wrong otherwise
+                    t0 = parse_addr(rpc.eth_call(pool, "0x0dfe1681"))
+                    t1 = parse_addr(rpc.eth_call(pool, "0xd21220a7"))
+                    upsert_pool(conn, pool, "univ3", "v3",
+                                t0 or token, t1 or hub, fee)
                     found += 1
             for venue, factory in (("univ2", UNIV2_FACTORY),
                                    ("sushi", SUSHI_FACTORY),
@@ -154,7 +163,10 @@ def scan_curated(rpc, conn):
                 r = rpc.eth_call(factory, "0xe6a43905" + pad(token) + pad(hub))
                 pool = parse_addr(r)
                 if pool:
-                    upsert_pool(conn, pool, venue, "v2", token, hub, 0)
+                    t0 = parse_addr(rpc.eth_call(pool, "0x0dfe1681"))
+                    t1 = parse_addr(rpc.eth_call(pool, "0xd21220a7"))
+                    upsert_pool(conn, pool, venue, "v2",
+                                t0 or token, t1 or hub, 0)
                     found += 1
     # final checkpoint + commit
     _commit_retry(conn)
@@ -237,6 +249,11 @@ def scan_camelot(rpc, conn, limit=0, min_depth=MIN_USD_DEPTH, eth_usd=2440.0,
             depth = 2 * d0 * eth_usd
         elif t0l in (USDC, USDCE):
             depth = 2 * d0
+        if depth > MAX_SANE_POOL_USD:
+            # parse/order bug or fabricated reserves — never feed edge math
+            print(f"[camelot] SUSPICIOUS depth ${depth:,.0f} on {pair} — clamped",
+                  flush=True)
+            depth = 0.0
         if depth >= min_depth:
             upsert_pool(conn, pair, "camelot", "v2", t0l, t1l, 0,
                         r0=d0, r1=d1, depth=depth)
@@ -283,6 +300,10 @@ def enrich(conn, rpc, eth_usd=2440.0):
             depth = 2 * d0 * eth_usd
         else:
             depth = 2 * d0
+        if depth > MAX_SANE_POOL_USD:
+            print(f"[enrich] SUSPICIOUS depth ${depth:,.0f} on {pair} — clamped",
+                  flush=True)
+            depth = 0.0
         with conn:
             conn.execute("UPDATE pools SET reserve0=?, reserve1=?, usd_depth=?, "
                          "last_checked=? WHERE pair_addr=?",
