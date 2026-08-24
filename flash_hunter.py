@@ -365,6 +365,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--deploy", action="store_true")
     ap.add_argument("--run", action="store_true")
+    ap.add_argument("--once", action="store_true",
+                    help="single cycle then exit (for cron watchdog)")
     ap.add_argument("--status", action="store_true")
     args = ap.parse_args()
 
@@ -386,6 +388,15 @@ def main():
         print(f"[hunter] executor {e} holds {weth/1e18:.8f} WETH profit")
         return
 
+    # single-cycle mode: one hunt pass then exit (cron watchdog owns cadence)
+    if args.once:
+        try:
+            hunt_once(rpc, acct, executor_addr, BROADCAST_RPCS[0])
+        except Exception as e:
+            print(f"[hunter-once] cycle error: {e}", flush=True)
+            log_event({"event": "error", "mode": "once", "error": str(e)[:200]})
+        return
+
     # hunt loop
     print(f"[hunter] hunting. executor={executor_addr} "
           f"interval={SCAN_INTERVAL_SEC}s gate=profit>{GAS_MULTIPLIER}x gas")
@@ -398,14 +409,17 @@ def main():
         except Exception as e:
             print(f"[hunter] cycle error: {e}", flush=True)
             log_event({"event": "error", "cycle": cycle, "error": str(e)[:200]})
-        if time.time() - last_hb > HEARTBEAT_EVERY_SEC:
-            last_hb = time.time()
-            eth = rpc.balance(acct.address) / 1e18
-            weth = call_weth_balance(rpc, executor_addr)
-            print(f"[heartbeat] cycle {cycle} ETH={eth:.6f} "
-                  f"executor WETH={weth/1e18:.8f}", flush=True)
-            log_event({"event": "heartbeat", "cycle": cycle, "eth": eth,
-                       "executor_weth": weth})
+        try:
+            if time.time() - last_hb > HEARTBEAT_EVERY_SEC:
+                last_hb = time.time()
+                eth = rpc.balance(acct.address) / 1e18
+                weth = call_weth_balance(rpc, executor_addr)
+                print(f"[heartbeat] cycle {cycle} ETH={eth:.6f} "
+                      f"executor WETH={weth/1e18:.8f}", flush=True)
+                log_event({"event": "heartbeat", "cycle": cycle, "eth": eth,
+                           "executor_weth": weth})
+        except Exception as e:
+            print(f"[hunter] heartbeat error (non-fatal): {e}", flush=True)
         time.sleep(SCAN_INTERVAL_SEC)
 
 

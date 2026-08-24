@@ -175,7 +175,12 @@ def _migrate(c):
     return v
 
 def conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.execute("PRAGMA busy_timeout=30000")  # wait out long census write windows
+    # WAL: concurrent readers + one writer. Kills the "database is locked"
+    # crash class between census / enrich / hunter processes (2026-08-23).
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.row_factory = sqlite3.Row
     return c
 
@@ -183,6 +188,13 @@ def init():
     c = conn()
     # Enable foreign key support
     c.execute("PRAGMA foreign_keys=ON;")
+    # FAST PATH: schema already current -> return WITHOUT any write
+    # transaction. Before this fix, every `import core` ran _migrate +
+    # full executescript, grabbing write locks from read-only tools and
+    # colliding with the running census.
+    if c.execute("PRAGMA user_version").fetchone()[0] >= USER_VERSION:
+        c.close()
+        return DB_PATH
     # DEFECT FIX: init() used to DROP TABLE targets unconditionally, wiping all
     # T1 analysis state on every pipeline run. Migration is now version-gated
     # and row-preserving (see _migrate).
