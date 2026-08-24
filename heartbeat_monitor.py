@@ -1,110 +1,137 @@
 #!/usr/bin/env python3
 """Forensic Heartbeat Monitor — Concrete, observable VERITAS system state.
 
-Every line below is VERIFIABLE. Check this yourself at any time.
+Monitors the ACTIVE flash-arb engine stack:
+  flash_hunter.py (live process) -> arb_engine + sim_gate -> core/rpc
+  pool_registry.py -> veritas.db pools table (Camelot census)
+  Executor V4 on-chain + hot wallet WETH/ETH balances.
+
+Every line below is VERIFIABLE on-chain. Check it yourself at any time.
 """
+import os, sys, json, time, sqlite3, subprocess
 
-import os, sys, json, time, sqlite3
+HERE = os.path.dirname(os.path.abspath(__file__))
+os.chdir(HERE)
 
-sys.path.insert(0, '.')
+WALLET = "0x1a0d467974E70e3c1a2b7b84fec21183Fc4eB60f"
 
-user_wallet = os.environ.get('VERITAS_USER_WALLET', 'NOT SET')
+def rpc(method, params):
+    import urllib.request
+    req = urllib.request.Request(
+        "https://arb1.arbitrum.io/rpc",
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read()).get("result")
+
+def eth_balance(addr):
+    r = rpc("eth_getBalance", [addr, "latest"])
+    return int(r, 16) / 1e18 if r else None
 
 print("=" * 60)
 print(f"VERITAS HEARTBEAT — {time.strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 60)
 print()
 
-# 1. Wallet — VERIFIABLE
-print("1. HOT WALLET REGISTRATION")
+# 1. Engine process — VERIFIABLE via tasklist
+print("1. FLASH HUNTER ENGINE")
 print("-" * 40)
-if user_wallet != 'NOT SET':
-    valid = user_wallet.startswith('0x') and len(user_wallet) == 42
-    print(f"   Env var: VERITAS_USER_WALLET = {user_wallet}")
-    print(f"   Format valid (0x + 40 hex): {'YES' if valid else 'NO'}")
-    print(f"   Status: ✓ REGISTERED for $10 auto-extraction")
-else:
-    print(f"   Env var: NOT SET")
-    print(f"   Status: ✗ NO WALLET REGISTERED")
+try:
+    out = subprocess.run(["powershell", "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
+        "Where-Object {$_.CommandLine -like '*flash_hunter*'} | "
+        "Select-Object -ExpandProperty ProcessId"],
+        capture_output=True, text=True, timeout=30).stdout.strip()
+    pids = [l.strip() for l in out.splitlines() if l.strip().isdigit()]
+    print(f"   flash_hunter.py --run PIDs: {', '.join(pids) if pids else 'NONE'}")
+    print(f"   Status: {'✓ RUNNING' if pids else '✗ DOWN'}")
+except Exception as e:
+    print(f"   Process check failed: {e}")
 print()
 
-# 2. System files — VERIFIABLE
-print("2. SYSTEM FILES")
+# 2. Log freshness — VERIFIABLE
+print("2. ENGINE LOG FRESHNESS (flash_hunter.log)")
 print("-" * 40)
-rtg = os.path.exists('realtrade_gate.py')
-print(f"   realtrade_gate.py present: {'YES' if rtg else 'NO'}")
-print(f"   Syntax valid: {'YES' if compile(open('realtrade_gate.py').read(), 'r', 'exec') else 'NO'}")
+try:
+    with open("flash_hunter.log", "r", encoding="utf-8", errors="replace") as f:
+        lines = [l for l in f.read().splitlines() if l.strip()]
+    last = json.loads(lines[-1]) if lines else {}
+    age = time.time() - time.mktime(time.strptime(last.get("ts", "1970-01-01 00:00:00"),
+                                                  "%Y-%m-%d %H:%M:%S"))
+    print(f"   Last log entry: {last.get('ts', 'NONE')} ({last.get('event', '?')})")
+    print(f"   Age: {int(age)}s — {'✓ FRESH (<1800s)' if age < 1800 else '✗ STALE'}")
+    # last heartbeat + last scan summary
+    hb = next((json.loads(l) for l in reversed(lines) if '"heartbeat"' in l), {})
+    sc = next((json.loads(l) for l in reversed(lines) if '"scan"' in l), {})
+    if hb: print(f"   Last heartbeat: cycle {hb.get('cycle')}, executor WETH={hb.get('executor_weth')}")
+    if sc: print(f"   Last scan: {sc.get('mode')}, {sc.get('combos')} combos, {sc.get('edges')} edges, ETH=${sc.get('eth_usd')}")
+except Exception as e:
+    print(f"   Log read failed: {e}")
 print()
 
-# 3. Database — VERIFIABLE
-print("3. DATABASE STATE")
+# 3. Executor — VERIFIABLE on-chain
+print("3. EXECUTOR CONTRACT (on-chain)")
 print("-" * 40)
-db_path = os.path.join(os.path.expanduser('~'), 'OneDrive', 'Documents', 'VERITAS', 'veritas.db')
-db_exists = os.path.exists(db_path)
-print(f"   Path: {db_path}")
-print(f"   File exists: {'YES' if db_exists else 'NO'}")
-if db_exists:
-    conn = sqlite3.connect(db_path)
+try:
+    with open(".executor_v2_address") as f:
+        exec_addr = f.read().strip()
+    print(f"   Executor V4: {exec_addr}")
+    code = rpc("eth_getCode", [exec_addr, "latest"])
+    print(f"   Deployed code: {'✓ YES (' + str(len(code)//2 - 1) + ' bytes)' if code and code != '0x' else '✗ NO CODE'}")
+    b = eth_balance(exec_addr)
+    print(f"   Executor ETH: {b}")
+except Exception as e:
+    print(f"   Executor check failed: {e}")
+print()
+
+# 4. Hot wallet — VERIFIABLE on-chain
+print("4. HOT WALLET (on-chain)")
+print("-" * 40)
+try:
+    b = eth_balance(WALLET)
+    print(f"   {WALLET}")
+    print(f"   ETH balance: {b}")
+    print(f"   Status: {'✓ LIVE' if b is not None else '✗ RPC FAIL'}")
+except Exception as e:
+    print(f"   Wallet check failed: {e}")
+print()
+
+# 5. Pool registry — VERIFIABLE in veritas.db
+print("5. POOL REGISTRY (veritas.db)")
+print("-" * 40)
+try:
+    conn = sqlite3.connect("veritas.db")
     c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM walker_state')
-    walker_count = c.fetchone()[0]
-    c.execute('SELECT chain_id, cur_block, processed_count, status FROM walker_state')
-    walker_state = c.fetchall()
-    c.execute('SELECT COUNT(*) FROM targets')
-    targets_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM pools")
+    pools = c.fetchone()[0]
+    c.execute("SELECT venue, COUNT(*) FROM pools GROUP BY venue ORDER BY 2 DESC")
+    venues = c.fetchall()
     conn.close()
-    print(f"   Walker state entries: {walker_count}")
-    print(f"   Targets in DB: {targets_count}")
-    if walker_state:
-        for ws in walker_state:
-            print(f"     Chain {ws[0]}: block {ws[1]}, processed {ws[2]}, status={ws[3]}")
+    print(f"   Total pools registered: {pools}")
+    for v, n in venues:
+        print(f"     {v}: {n}")
+except Exception as e:
+    print(f"   Registry check failed: {e}")
 print()
 
-# 4. ACE Position — VERIFIABLE
-print("4. ACTIVE POSITION (ACE LONG)")
+# 6. Watchdog cron — VERIFIABLE
+print("6. WATCHDOG")
 print("-" * 40)
-# Read current state from the running system
-import __main__
-# Check if realtrade_gate has been run by looking for key indicators
-if os.path.exists('veritas.db'):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    # Check findings for ACE-related entries
-    try:
-        c.execute("SELECT * FROM findings WHERE address LIKE '%%'")
-        findings = c.fetchall()
-        print(f"   Findings entries: {len(findings)}")
-    except:
-        print(f"   Findings: schema check")
-    conn.close()
-print("   Position: LONG ACE @ 0.2208 (3x leverage)")
-print("   Size: 246.56 ACE notional $54.39 on $18.12 equity")
-print("   Hard stop: 0.1800 (exchange-confirmed)")
-print("   Current uPnL: -$0.05 (entry spread noise)")
-print("   Funding: -0.036%/hr (persistent negative)")
+print("   Cron job: ec2016bb9a90 (*/30 * * * *)")
+print("   Checks engine + restarts if down (verify: hermes cron list)")
 print()
 
-# 5. Constraints — VERIFIABLE
-print("5. CONSTRAINT STATUS")
+# 7. Constraint summary
+print("7. CONSTRAINT STATUS")
 print("-" * 40)
 checks = {
-    "Wallet registered": user_wallet != 'NOT SET',
-    "realtrade_gate.py": rtg,
-    "DB accessible": db_exists,
-    "Emergency stop $7": True,  # Hard-coded in system
-    "3-min check": True,  # Hard-coded interval
-    "Extraction $10": user_wallet != 'NOT SET',  # Enabled when wallet set
+    "Engine process": bool(pids),
+    "Log fresh (<30min)": age < 1800,
+    "Executor deployed": bool(code and code != "0x"),
+    "Pool registry": pools > 0,
 }
 for check, status in checks.items():
     print(f"   {check}: {'✓ ENABLED' if status else '✗ DISABLED'}")
-print()
-
-# 6. Heartbeat timestamp
-print("6. HEARTBEAT")
-print("-" * 40)
-print(f"   Last check: {time.strftime('%H:%M:%S')}")
-print(f"   System: ONLINE and monitoring")
-print(f"   Awaiting: profitable cycle, $10 PnL threshold, or emergency halt")
 print()
 
 print("=" * 60)
