@@ -9,10 +9,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root (core/)
 from core.rpc import RPC
 from core.selectors import kec256
 
-RPC_URL = "https://arbitrum.publicnode.com"
+RPC_URL = "https://arbitrum-one-rpc.publicnode.com"
 USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 BRIDGE = "0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7"
 CHAIN_ID = 42161
@@ -29,14 +30,24 @@ def u256(v):
 
 def load_acct():
     from eth_account import Account
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           ".hl_secret")) as f:
-        return Account.from_key(f.read().strip())
+    # script lives in hyperliquid/; secret is at repo root (parent dir)
+    here = os.path.dirname(os.path.abspath(__file__))
+    # .hot_secret = the carry-engine trading account (holds the on-chain USDC)
+    for cand in (os.path.join(here, "..", ".hot_secret"),
+                 os.path.join(here, "..", ".hl_secret"),
+                 os.path.join(here, ".hl_secret")):
+        cand = os.path.normpath(cand)
+        if os.path.isfile(cand):
+            with open(cand) as f:
+                return Account.from_key(f.read().strip())
+    raise SystemExit("ERROR: .hl_secret not found (repo root or hyperliquid/)")
 
 
 def send_and_wait(rpc, acct, tx, label):
     signed = acct.sign_transaction(tx)
-    raw = signed.raw_transaction.hex()
+    # eth_account 0.11.x exposes .rawTransaction; newer versions .raw_transaction
+    raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+    raw = raw.hex()
     if raw.startswith("0x"):
         raw = raw[2:]
     txh = rpc.call("eth_sendRawTransaction", ["0x" + raw])
