@@ -29,7 +29,18 @@ USDCE = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
 
 V3_FACTORY  = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
 QUOTER_V2   = "0x61ffe014ba17989e743c5f6cb21bf9697530b21e"
+
+# Additional V3 venues (deployed on Arbitrum)
+SUSHI_V3_FACTORY  = "0x1af415a1eba07a4986a52b6f2e7de7003d82231e"
+PANCAKE_V3_FACTORY = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
+RAMSES_V3_FACTORY  = "0xaa2cd7477c451e703f3b9ba5663334914763edf8"
+CAMELOT_V3_FACTORY = "0x1a3c9b1d2f0529d97f2afc5136cc23e58f1fd35b"  # Algebra
+
+PANCAKE_QUOTER_V2  = "0xb048bBc1Ee6b733FFfCFb9e9CeF7375518e25997"
+CAMELOT_V3_QUOTER  = "0xFe24b2cDfF01B644995bc248bA8497467d688F7B"
+
 FEE_TIERS   = (100, 500, 3000, 10000)   # 0.01% 0.05% 0.3% 1%
+PANCAKE_FEE_TIERS = (100, 500, 2500, 10000)  # Pancake/Camelot V3 use 2500 instead of 3000
 
 SEL = {
     "getPool":     "0x1698ee82",  # getPool(address,address,uint24)
@@ -68,10 +79,10 @@ def quoter_selector():
 
 # ---- pool census ----------------------------------------------------------
 
-def v3_pool(rpc, token_a, token_b, fee):
-    r = rpc.eth_call(V3_FACTORY, SEL["getPool"] + pad(token_a)
+def v3_pool(rpc, token_a, token_b, fee, factory=V3_FACTORY):
+    r = rpc.eth_call(factory, SEL["getPool"] + pad(token_a)
                      + pad(token_b) + u256(fee))
-    return parse_addr(r)
+    return parse_addr(r) if r else None
 
 
 def pool_liquidity(rpc, pool):
@@ -95,33 +106,117 @@ def census_v3(rpc, base=WETH, quotes=(USDC, USDCE)):
 
 # ---- executable quotes ----------------------------------------------------
 
-def quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr):
+def quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, quoter=QUOTER_V2):
     """Exact out for token_in -> token_out via the (fee) pool. None on revert.
 
     Returns integer raw amount_out. Uses eth_call simulation of QuoterV2.
+    Note: QuoterV2 returns (amountOut, sqrtPriceX96After, ...) tuple where
+    amountOut is in the SECOND 32-byte word (index 1), not the first.
     """
     data = ("0x" + quoter_selector()
             + pad(token_in) + pad(token_out) + u256(amount_in)
             + u256(fee) + u256(0))          # sqrtPriceLimitX96 = 0 (none)
     try:
-        r = rpc.call("eth_call", [{"from": from_addr, "to": QUOTER_V2,
+        r = rpc.call("eth_call", [{"from": from_addr, "to": quoter,
                                    "data": data}, "latest"])
-        if not r or r == "0x" or len(r) < 66:
+        if not r or r == "0x" or len(r) < 130:
             return None
-        return int(r[2:66], 16)   # first return word = amountOut
+        # amountOut is in the SECOND word (bytes 66-130 after 0x prefix)
+        return int(r[66:130], 16)
     except Exception:
         return None
 
 
 def quote_v3_best(rpc, token_in, token_out, amount_in, from_addr,
-                  fees=FEE_TIERS):
+                  fees=FEE_TIERS, quoter=QUOTER_V2):
     """Best executable out across fee tiers. Returns (out, fee, pool) or None."""
     best = None
     for fee in fees:
-        out = quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr)
+        out = quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, quoter)
         if out and (best is None or out > best[0]):
             pool = v3_pool(rpc, token_in, token_out, fee)
             best = (out, fee, pool)
+    return best
+
+
+# ---- multi-venue quoting --------------------------------------------------
+
+def quote_v3_venue(rpc, token_in, token_out, amount_in, fee, from_addr, venue):
+    """Quote via a specific V3 venue (uniswap, sushi, pancake, ramses, camelot).
+    
+    Returns (amount_out, pool_address) or (None, None).
+    """
+    venue_config = {
+        "uniswap": {
+            "factory": V3_FACTORY,
+            "quoter": QUOTER_V2,
+            "fee_tiers": FEE_TIERS,
+        },
+        "sushi": {
+            "factory": SUSHI_V3_FACTORY,
+            "quoter": QUOTER_V2,  # Sushi V3 uses same quoter interface
+            "fee_tiers": FEE_TIERS,
+        },
+        "pancake": {
+            "factory": PANCAKE_V3_FACTORY,
+            "quoter": PANCAKE_QUOTER_V2,
+            "fee_tiers": PANCAKE_FEE_TIERS,
+        },
+        "ramses": {
+            "factory": RAMSES_V3_FACTORY,
+            "quoter": QUOTER_V2,  # Ramses is Uniswap V3 fork
+            "fee_tiers": FEE_TIERS,
+        },
+        # "camelot": {
+        #     "factory": CAMELOT_V3_FACTORY,
+        #     "quoter": CAMELOT_V3_QUOTER,
+        #     "fee_tiers": PANCAKE_FEE_TIERS,  # Algebra uses same fee tiers
+        # },
+    }
+    
+    cfg = venue_config.get(venue)
+    if not cfg:
+        return None, None
+    
+    if fee not in cfg["fee_tiers"]:
+        return None, None
+    
+    pool = v3_pool(rpc, token_in, token_out, fee, cfg["factory"])
+    if not pool:
+        return None, None
+    
+    out = quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, cfg["quoter"])
+    return out, pool
+
+
+def quote_v3_best_multi(rpc, token_in, token_out, amount_in, from_addr,
+                        venues=("uniswap", "sushi", "pancake", "ramses")):
+    """Best executable out across multiple V3 venues and their fee tiers.
+    
+    Returns (amount_out, fee, pool, venue) or None.
+    """
+    best = None
+    for venue in venues:
+        cfg = {
+            "uniswap": (V3_FACTORY, QUOTER_V2, FEE_TIERS),
+            "sushi": (SUSHI_V3_FACTORY, QUOTER_V2, FEE_TIERS),
+            "pancake": (PANCAKE_V3_FACTORY, PANCAKE_QUOTER_V2, PANCAKE_FEE_TIERS),
+            "ramses": (RAMSES_V3_FACTORY, QUOTER_V2, FEE_TIERS),
+            # "camelot": (CAMELOT_V3_FACTORY, CAMELOT_V3_QUOTER, PANCAKE_FEE_TIERS),
+        }.get(venue)
+        
+        if not cfg:
+            continue
+        
+        factory, quoter, fee_tiers = cfg
+        
+        for fee in fee_tiers:
+            pool = v3_pool(rpc, token_in, token_out, fee, factory)
+            if not pool:
+                continue
+            out = quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, quoter)
+            if out and (best is None or out > best[0]):
+                best = (out, fee, pool, venue)
     return best
 
 

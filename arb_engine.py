@@ -182,9 +182,30 @@ def token_symbol(addr):
 
 # ---- cross-venue scan (V2 x V3 via QuoterV2 executable quotes) -----------
 
+def _v3_sort_key(liquidity, fee):
+    """Normalize V3 raw liquidity to a comparable USD-depth scale.
+
+    V3 liquidity L has units of sqrt(token0)*sqrt(token1) and ranges
+    10^12–10^24.  V2 usd_depth is actual USD (10^2–10^6).  Without
+    normalization the sort silently drops every V2 pool.
+
+    We use log10(L) − 10 so that the deepest V3 pools (~10^18–10^24)
+    score 8–14 while the shallowest (~10^12–10^13) score 2–3 —
+    overlapping the V2 range (2–6).  Fee-tier adjustment: higher fee
+    pools deploy less capital for the same L, so we discount them.
+    """
+    import math
+    if liquidity <= 0:
+        return 0.0
+    base = math.log10(liquidity) - 10.0
+    # discount by fee tier: 1% fee pools need ~10× more L for same depth
+    fee_discount = {100: 0.0, 500: 0.3, 3000: 0.7, 10000: 1.2}
+    return base - fee_discount.get(fee, 0.7)
+
+
 def _load_registry_pools(rpc):
     """Read registered pools from veritas.db. Returns (v3_census, v2_pools)."""
-    import sqlite3
+    import sqlite3, math
     DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "veritas.db")
     conn = sqlite3.connect(DB, timeout=30)
     conn.execute("PRAGMA busy_timeout=30000")
@@ -206,7 +227,9 @@ def _load_registry_pools(rpc):
                 continue
             quote = t1l if t0l == WETH else t0l
             v3.append({"pool": addr, "fee": fee, "quote": quote,
-                       "liquidity": L, "name": f"{venue} V3 {fee/10000:.2f}%"})
+                       "liquidity": L,
+                       "sort_key": _v3_sort_key(L, fee),
+                       "name": f"{venue} V3 {fee/10000:.2f}%"})
         elif kind == "v2":
             # only keep WETH-paired V2 pools with depth
             if t0l == WETH:
@@ -233,9 +256,57 @@ def _load_registry_pools(rpc):
                 "weth_reserve": br,
                 "quote_reserve": qr,
                 "usd_depth": depth,
+                "sort_key": math.log10(depth + 1) if depth > 0 else 0.0,
             }
             v2.append(p)
     return v3, v2
+
+
+# ---- stale V3 pool detection ---------------------------------------------
+
+def _check_v3_pool_stale(rpc, pool_addr, quote_addr, eth_usd, threshold_pct=0.02):
+    """
+    Check if a V3 pool has stale price by comparing quoter output
+    to actual reserve-based price.
+    
+    Returns True if pool is stale (price deviates > threshold_pct from reserves).
+    """
+    try:
+        from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
+        
+        # Get actual reserves
+        WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+        weth_bal = rpc.eth_call(WETH, "0x70a08231" + pool_addr[2:].lower().rjust(64, '0'))
+        quote_bal = rpc.eth_call(quote_addr, "0x70a08231" + pool_addr[2:].lower().rjust(64, '0'))
+        
+        if not weth_bal or not quote_bal or len(weth_bal) < 66 or len(quote_bal) < 66:
+            return True  # Can't verify, assume stale
+        
+        weth_reserve = int(weth_bal[2:66], 16) / 1e18
+        quote_reserve = int(quote_bal[2:66], 16) / 1e6  # USDC/USDC.e = 6 decimals
+        
+        if weth_reserve <= 0 or quote_reserve <= 0:
+            return True
+        
+        # Actual price from reserves (USDC per WETH)
+        actual_price = quote_reserve / weth_reserve
+        
+        # Get quoter price for 1 WETH
+        amt = 10**18
+        quoter_price_raw = v3_layer.quote_v3(rpc, WETH, quote_addr, amt, 500, from_addr)
+        if not quoter_price_raw:
+            return True
+        quoter_price = quoter_price_raw / 1e6  # USDC per WETH
+        
+        # Check deviation
+        if actual_price <= 0:
+            return True
+        
+        deviation = abs(quoter_price - actual_price) / actual_price
+        return deviation > threshold_pct
+        
+    except Exception:
+        return True  # On any error, assume stale
 
 
 def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=10, max_venues_per_quote=4):
@@ -254,20 +325,42 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=10, max_venues_per_quote=
     quotes = {}
     for p in v3_census:
         quotes.setdefault(p["quote"], []).append(
-            (p["name"], 1, p["pool"], p["fee"], p["liquidity"]))
+            (p["name"], 1, p["pool"], p["fee"], p["sort_key"]))
     for p in v2_pools:
         quotes.setdefault(p["quote"], []).append(
-            (p["name"], 0, p["address"], 0, p.get("usd_depth", 0)))
+            (p["name"], 0, p["address"], 0, p["sort_key"]))
 
     for quote, venues in quotes.items():
         qsym = token_symbol(quote)
         if len(venues) < 2:
             continue
-        # sort by depth/liquidity descending, cap count
+        # sort by depth/liquidity descending, cap count.
+        # Guarantee at least 1 V2 venue per quote so cross-venue V3<->V2
+        # edges are not silently dropped (the old bug).
         venues.sort(key=lambda x: x[4], reverse=True)
-        venues = venues[:max_venues_per_quote]
+        v2_venues = [v for v in venues if v[1] == 0]
+        v3_venues = [v for v in venues if v[1] == 1]
+        if v2_venues:
+            keep = [v2_venues[0]]  # deepest V2 always kept
+            keep += [v for v in v3_venues if v not in keep]
+            keep += [v for v in v2_venues if v not in keep]
+            venues = keep[:max_venues_per_quote]
+        else:
+            venues = venues[:max_venues_per_quote]
         q_dec = token_decimals(rpc, quote)
 
+        # Pre-filter: mark stale V3 venues
+        stale_venues = set()
+        for name, kind, pool_addr, fee, sort_key in venues:
+            if kind == 1:  # V3
+                if _check_v3_pool_stale(rpc, pool_addr, quote, eth_usd):
+                    stale_venues.add((name, kind, pool_addr, fee, sort_key))
+        
+        # Remove stale V3 venues
+        venues = [v for v in venues if v not in stale_venues]
+        if len(venues) < 2:
+            continue
+        
         for i in range(len(venues)):
             for j in range(len(venues)):
                 if i == j:
@@ -341,7 +434,7 @@ def v2_quote_out(rpc, pair, token_in, token_out, amount_in, q_dec=None):
     if t0 is None or r0 is None:
         return None
     dec_in = token_decimals(rpc, token_in)
-    dec_out = q_dec if q_dec is not None else token_decimals(rpc, token_out)
+    dec_out = token_decimals(rpc, token_out)
     in_h = amount_in / 10 ** dec_in
     if t0.lower() == token_in.lower():
         out_h = cp_out(r0 / 10 ** dec_in, r1 / 10 ** dec_out, in_h)
@@ -478,7 +571,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    rpc = RPC(args.rpc, timeout=30, retries=3)
+    rpc = RPC(args.rpc, timeout=60, retries=3)
     cycle = 0
     while True:
         cycle += 1

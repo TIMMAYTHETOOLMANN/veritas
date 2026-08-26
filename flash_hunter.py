@@ -184,14 +184,23 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
     """One hunt cycle: registry cross-venue scan -> sim candidates -> broadcast if gate passes."""
     from core.rpc import RPC as Vrpc
     import v3_layer
-    r = Vrpc(rpc_scan, timeout=30, retries=3)
-    # ETH price + gas from the V3 quoter itself (ground truth)
-    out = v3_layer.quote_v3(r, v3_layer.WETH, v3_layer.USDC, 10**18, 500,
-                            acct.address)
-    if not out:
-        print(f"[{time.strftime('%H:%M:%S')}] no quoter response — skipping cycle", flush=True)
-        return None
-    eth_usd = out / 1e6
+    r = Vrpc(rpc_scan, timeout=120, retries=3)
+    # ETH price + gas from a reliable V2 pool (V3 pools have stale prices)
+    # Use Sushi WETH/USDC pool for ground truth price
+    SUSHI_WETH_USDC = "0x57b85fef094e10b5eecdf350af688299e9553378"
+    weth_bal = rpc.eth_call("0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+                            "0x70a08231" + SUSHI_WETH_USDC[2:].lower().rjust(64, '0'))
+    usdc_bal = rpc.eth_call("0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+                            "0x70a08231" + SUSHI_WETH_USDC[2:].lower().rjust(64, '0'))
+    if weth_bal and usdc_bal and len(weth_bal) >= 66 and len(usdc_bal) >= 66:
+        weth_res = int(weth_bal[2:66], 16) / 1e18
+        usdc_res = int(usdc_bal[2:66], 16) / 1e6
+        eth_usd = usdc_res / weth_res if weth_res > 0 else 2450.0
+    else:
+        # Fallback to V3 quoter (may be stale)
+        out = v3_layer.quote_v3(r, v3_layer.WETH, v3_layer.USDC, 10**18, 500,
+                                acct.address)
+        eth_usd = out / 1e6 if out else 2450.0
     gas_wei = uint_or_zero(r.call("eth_gasPrice", []))
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     try:
