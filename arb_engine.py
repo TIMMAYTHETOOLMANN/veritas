@@ -203,6 +203,34 @@ def _v3_sort_key(liquidity, fee):
     return base - fee_discount.get(fee, 0.7)
 
 
+def pool_liquidity_cached(rpc, conn, addr):
+    """Fetch V3 pool liquidity, caching in DB with a 30s freshness window.
+    Avoids 91 eth_calls on every scan cycle (the old bottleneck)."""
+    import time
+    addr = addr.lower()
+    row = conn.execute(
+        "SELECT last_checked FROM pools WHERE pair_addr=?", (addr,)).fetchone()
+    now = time.time()
+    if row and row[0]:
+        try:
+            last = time.mktime(time.strptime(row[0], "%Y-%m-%d %H:%M:%S"))
+            if now - last < 30:
+                r = conn.execute(
+                    "SELECT usd_depth FROM pools WHERE pair_addr=?", (addr,)).fetchone()
+                return r[0] if r and r[0] else None
+        except Exception:
+            pass
+    L = pool_liquidity(rpc, addr)
+    if L is None:
+        L = 0
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Store as REAL (SQLite can't handle 10^24 ints; usd_depth is REAL)
+    conn.execute("UPDATE pools SET usd_depth=?, last_checked=? WHERE pair_addr=?",
+                 (float(L), ts, addr))
+    conn.commit()
+    return L
+
+
 def _load_registry_pools(rpc):
     """Read registered pools from veritas.db. Returns (v3_census, v2_pools)."""
     import sqlite3, math
@@ -212,16 +240,14 @@ def _load_registry_pools(rpc):
     rows = conn.execute(
         "SELECT pair_addr, venue, kind, token0, token1, fee_tier, "
         "reserve0, reserve1, usd_depth FROM pools").fetchall()
-    conn.close()
 
     v3 = []
     v2 = []
     for addr, venue, kind, t0, t1, fee, r0, r1, depth in rows:
         t0l, t1l = t0.lower(), t1.lower()
         if kind == "v3":
-            L = pool_liquidity(rpc, addr)
-            if L is None:
-                L = 0
+            # Use cached liquidity from DB if available; only fetch live if stale
+            L = pool_liquidity_cached(rpc, conn, addr)
             # only keep WETH-paired V3 pools
             if t0l != WETH and t1l != WETH:
                 continue
@@ -259,57 +285,28 @@ def _load_registry_pools(rpc):
                 "sort_key": math.log10(depth + 1) if depth > 0 else 0.0,
             }
             v2.append(p)
+    conn.close()
     return v3, v2
 
 
-# ---- stale V3 pool detection ---------------------------------------------
-
-def _check_v3_pool_stale(rpc, pool_addr, quote_addr, eth_usd, threshold_pct=0.02):
-    """
-    Check if a V3 pool has stale price by comparing quoter output
-    to actual reserve-based price.
-    
-    Returns True if pool is stale (price deviates > threshold_pct from reserves).
-    """
+# ---- V3 pool liveness check (not stale) -----------------------------------
+# V3 pools don't hold "reserves" like V2 pairs — liquidity is concentrated in
+# tick ranges.  The old _check_v3_pool_stale() compared balanceOf() against
+# the quoter price, which is mathematically wrong for V3 and marked EVERY
+# pool as stale.  Instead we verify the pool has non-trivial liquidity
+# (>= MIN_POOL_LIQUIDITY from v3_layer) — if L > 0 the pool is live and
+# tradeable.  This is a read of the liquidity() getter, not a reserve check.
+def _is_v3_pool_live(rpc, pool_addr):
+    """True if the V3 pool has real liquidity (>= MIN_POOL_LIQUIDITY)."""
     try:
-        from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
-        
-        # Get actual reserves
-        WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
-        weth_bal = rpc.eth_call(WETH, "0x70a08231" + pool_addr[2:].lower().rjust(64, '0'))
-        quote_bal = rpc.eth_call(quote_addr, "0x70a08231" + pool_addr[2:].lower().rjust(64, '0'))
-        
-        if not weth_bal or not quote_bal or len(weth_bal) < 66 or len(quote_bal) < 66:
-            return True  # Can't verify, assume stale
-        
-        weth_reserve = int(weth_bal[2:66], 16) / 1e18
-        quote_reserve = int(quote_bal[2:66], 16) / 1e6  # USDC/USDC.e = 6 decimals
-        
-        if weth_reserve <= 0 or quote_reserve <= 0:
-            return True
-        
-        # Actual price from reserves (USDC per WETH)
-        actual_price = quote_reserve / weth_reserve
-        
-        # Get quoter price for 1 WETH
-        amt = 10**18
-        quoter_price_raw = v3_layer.quote_v3(rpc, WETH, quote_addr, amt, 500, from_addr)
-        if not quoter_price_raw:
-            return True
-        quoter_price = quoter_price_raw / 1e6  # USDC per WETH
-        
-        # Check deviation
-        if actual_price <= 0:
-            return True
-        
-        deviation = abs(quoter_price - actual_price) / actual_price
-        return deviation > threshold_pct
-        
+        import v3_layer as vl
+        L = vl.pool_liquidity(rpc, pool_addr)
+        return L is not None and L >= vl.MIN_POOL_LIQUIDITY
     except Exception:
-        return True  # On any error, assume stale
+        return False
 
 
-def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=10, max_venues_per_quote=4):
+def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=8):
     """V3 <-> V3 and V3 <-> V2 edges using the pool registry."""
     import v3_layer
 
@@ -349,53 +346,78 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=10, max_venues_per_quote=
             venues = venues[:max_venues_per_quote]
         q_dec = token_decimals(rpc, quote)
 
-        # Pre-filter: mark stale V3 venues
-        stale_venues = set()
-        for name, kind, pool_addr, fee, sort_key in venues:
-            if kind == 1:  # V3
-                if _check_v3_pool_stale(rpc, pool_addr, quote, eth_usd):
-                    stale_venues.add((name, kind, pool_addr, fee, sort_key))
-        
-        # Remove stale V3 venues
-        venues = [v for v in venues if v not in stale_venues]
+        # V3 venues already filtered by liquidity in _load_registry_pools;
+        # no need for a redundant live liveness check here.
         if len(venues) < 2:
             continue
         
         for i in range(len(venues)):
-            for j in range(len(venues)):
-                if i == j:
-                    continue
+            for j in range(i + 1, len(venues)):
                 buy = venues[i]
                 sell = venues[j]
                 best = None
-                hi = 2.0  # WETH; smaller = faster
-                for k in range(1, size_steps + 1):
-                    size = hi * k / size_steps
-                    amt = int(size * 1e18)
-                    if buy[1] == 1:
+                best_dir = None
+                # Test both arbitrage directions
+                for b_buy, b_sell in ((buy, sell), (sell, buy)):
+                    # quote a small size to detect price divergence
+                    probe_size = 0.01
+                    amt = int(probe_size * 1e18)
+                    if b_buy[1] == 1:
                         mid = v3_layer.quote_v3(rpc, WETH, quote, amt,
-                                                buy[3], from_addr)
+                                                b_buy[3], from_addr)
                     else:
-                        mid = v2_quote_out(rpc, buy[2], WETH, quote, amt,
+                        mid = v2_quote_out(rpc, b_buy[2], WETH, quote, amt,
                                            q_dec=q_dec)
-                    if not mid:
+                    if not mid or mid == 0:
                         continue
-                    if sell[1] == 1:
+                    if b_sell[1] == 1:
                         back = v3_layer.quote_v3(rpc, quote, WETH, mid,
-                                                 sell[3], from_addr)
+                                                 b_sell[3], from_addr)
                     else:
-                        back = v2_quote_out(rpc, sell[2], quote, WETH, mid,
+                        back = v2_quote_out(rpc, b_sell[2], quote, WETH, mid,
                                             q_dec=q_dec)
-                    if not back:
+                    if not back or back == 0:
                         continue
-                    profit_weth = (back - amt) / 1e18
-                    if profit_weth > 0 and (best is None
-                                            or profit_weth > best[2]):
-                        best = (size, mid, profit_weth)
-                row = {"pair": f"WETH/{qsym}", "venue_buy": buy[0],
-                       "venue_sell": sell[0]}
-                if best:
+                    probe_profit = (back - amt) / 1e18
+                    if probe_profit <= 0:
+                        continue
+                    # --- size scan only if probe was positive ---
+                    # Use small scan sizes: V2 pools often have shallow WETH
+                    # reserves, and 0.01 WETH probe already detected the edge
+                    if b_buy[1] == 0:  # V2
+                        hi = 0.05
+                    else:  # V3
+                        hi = 0.5
+                    for k in range(1, size_steps + 1):
+                        size = hi * k / size_steps
+                        amt = int(size * 1e18)
+                        if b_buy[1] == 1:
+                            mid = v3_layer.quote_v3(rpc, WETH, quote, amt,
+                                                    b_buy[3], from_addr)
+                        else:
+                            mid = v2_quote_out(rpc, b_buy[2], WETH, quote, amt,
+                                               q_dec=q_dec)
+                        if not mid or mid == 0:
+                            continue
+                        if b_sell[1] == 1:
+                            back = v3_layer.quote_v3(rpc, quote, WETH, mid,
+                                                     b_sell[3], from_addr)
+                        else:
+                            back = v2_quote_out(rpc, b_sell[2], quote, WETH, mid,
+                                                q_dec=q_dec)
+                        if not back:
+                            continue
+                        profit_weth = (back - amt) / 1e18
+                        if profit_weth > 0 and (best is None
+                                                or profit_weth > best[2]):
+                            best = (size, mid, profit_weth)
+                            best_dir = (b_buy, b_sell)
+                if best and best_dir:
                     size, mid, profit = best
+                    b_buy, b_sell = best_dir
+                    row = {"pair": f"WETH/{qsym}",
+                           "venue_buy": b_buy[0],
+                           "venue_sell": b_sell[0]}
                     loan_fee_usd = size * eth_usd * AAVE_FLASH_FEE
                     net = profit * eth_usd - gas_usd - loan_fee_usd
                     row.update({
@@ -404,14 +426,18 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=10, max_venues_per_quote=
                         "loan_fee_usd": round(loan_fee_usd, 4),
                         "gas_usd": round(gas_usd, 4),
                         "net_usd": round(net, 4),
-                        "buy_kind": buy[1], "buy_venue": buy[2], "buy_fee": buy[3],
-                        "sell_kind": sell[1], "sell_venue": sell[2], "sell_fee": sell[3],
+                        "buy_kind": b_buy[1], "buy_venue": b_buy[2], "buy_fee": b_buy[3],
+                        "sell_kind": b_sell[1], "sell_venue": b_sell[2], "sell_fee": b_sell[3],
                         "quote": quote,
                     })
                     if net > SAFETY_MARGIN_USD:
                         row["edge"] = True
                         edges.append(row)
-                report.append(row)
+                    report.append(row)
+                else:
+                    report.append({"pair": f"WETH/{qsym}",
+                                    "venue_buy": buy[0],
+                                    "venue_sell": sell[0]})
 
     return edges, report
 

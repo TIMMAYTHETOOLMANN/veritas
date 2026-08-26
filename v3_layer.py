@@ -110,8 +110,10 @@ def quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, quoter=QUOTER_
     """Exact out for token_in -> token_out via the (fee) pool. None on revert.
 
     Returns integer raw amount_out. Uses eth_call simulation of QuoterV2.
-    Note: QuoterV2 returns (amountOut, sqrtPriceX96After, ...) tuple where
-    amountOut is in the SECOND 32-byte word (index 1), not the first.
+    QuoterV2's quoteExactInputSingle returns a single uint256 (amountOut),
+    which is in the FIRST 32-byte word of the result (bytes 0-64, or r[2:66]
+    after the '0x' prefix).  The old code read the SECOND word (sqrtPriceX96After)
+    producing nonsensical multi-quadrillion values.
     """
     data = ("0x" + quoter_selector()
             + pad(token_in) + pad(token_out) + u256(amount_in)
@@ -119,10 +121,10 @@ def quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, quoter=QUOTER_
     try:
         r = rpc.call("eth_call", [{"from": from_addr, "to": quoter,
                                    "data": data}, "latest"])
-        if not r or r == "0x" or len(r) < 130:
+        if not r or r == "0x" or len(r) < 68:
             return None
-        # amountOut is in the SECOND word (bytes 66-130 after 0x prefix)
-        return int(r[66:130], 16)
+        # amountOut is in the FIRST word (bytes 2-66 after 0x prefix)
+        return int(r[2:66], 16)
     except Exception:
         return None
 

@@ -44,8 +44,8 @@ BROADCAST_RPCS = [
 
 SCAN_INTERVAL_SEC = 180      # cross-venue quoter scan is ~2 min
 HEARTBEAT_EVERY_SEC = 15 * 60
-GAS_MULTIPLIER = 3           # smaller = more trades on smaller edges
-MIN_PROFIT_USD = 0.10        # allow sub-$0.50 edges (gas is ~$0.02)
+GAS_MULTIPLIER = 2           # profit must exceed 2x gas (was 3, too tight)
+MIN_PROFIT_USD = 0.05        # allow sub-$0.50 edges (gas is ~$0.02)
 V3_ROUTER = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
 SWEEP_THRESHOLD_WETH = 0.001  # auto-sweep profit above this to hot wallet
 
@@ -205,8 +205,8 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     try:
         edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
-                                                     size_steps=8,
-                                                     max_venues_per_quote=4)
+                                                     size_steps=12,
+                                                     max_venues_per_quote=8)
     except Exception as e:
         print(f"[hunter] registry scan failed: {e}", flush=True)
         log_event({"event": "scan_error", "error": str(e)[:200]})

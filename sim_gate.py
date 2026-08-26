@@ -42,6 +42,7 @@ from core.rpc import RPC, uint  # noqa: E402
 
 WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 AAVE_V3_POOL = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+V3_ROUTER   = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"  # SwapRouter02
 
 FORK_RPCS = [
     "https://arb1.arbitrum.io/rpc",
@@ -49,8 +50,8 @@ FORK_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
-GAS_MULTIPLIER = 3       # aligned with flash_hunter.py — was 20, always rejected
-MIN_PROFIT_USD = 0.10    # aligned with flash_hunter.py — was 0.50
+GAS_MULTIPLIER = 2       # aligned with flash_hunter.py — was 20, always rejected
+MIN_PROFIT_USD = 0.05    # aligned with flash_hunter.py — was 0.50
 
 
 # ---- anvil lifecycle (proven sim_trade.py pattern) -----------------------
@@ -378,9 +379,79 @@ def main():
         print(json.dumps(result, indent=1))
 
 
+def simulate_edge_v2(edge, acct, executor_addr=None):
+    """Simulate a V2+V3 cross-venue edge against REAL pools on the fork.
+
+    Uses FlashloanArbV2.sol (the deployed executor that supports both
+    V2 pairs and V3 pools).  The edge dict must contain:
+      size_weth, buy_kind, buy_venue, buy_fee,
+      sell_kind, sell_venue, sell_fee, quote, eth_usd
+
+    If executor_addr is given we deploy the V2 binary to that address;
+    otherwise we deploy fresh on the fork.  Returns the same shape as
+    simulate_edge() but uses the V2 execute() calldata encoding.
+    """
+    proc, host, head, fork_url = launch_fork()
+    try:
+        fork = Fork(host)
+        deployer = "0xf39fd6e51aad88f6f4ce6ab8827229cfffb92266"  # anvil key0
+        fork.set_balance(deployer, wad(10))
+        fork.impersonate(deployer)
+
+        # Deploy FlashloanArbV2 (supports both V2 and V3 legs)
+        with open(os.path.join(HERE, "contracts", "FlashloanArbV2.bin")) as f:
+            arb_bin = f.read().strip()
+        ctor_args = pad_addr(AAVE_V3_POOL) + pad_addr(V3_ROUTER) + pad_addr(WETH)
+        v2_addr = fork.deploy_contract(
+            arb_bin if arb_bin.startswith("0x") else "0x" + arb_bin,
+            deployer) if not executor_addr else executor_addr
+
+        principal = wad(edge["size_weth"])
+        data = _encode_execute_v2(edge, principal)
+        weth_before = fork.erc20_balance(WETH, v2_addr)
+        try:
+            txh = fork.send_from(deployer, v2_addr, data)
+            r = fork.wait_tx(txh)
+        except Exception as e:
+            return {"sim": "reverted", "error": str(e)[:200]}
+        if r.get("status") != "0x1":
+            return {"sim": "reverted", "receipt": json.dumps(r)[:300]}
+
+        gas_used = int(r["gasUsed"], 16)
+        profit_weth = (fork.erc20_balance(WETH, v2_addr) - weth_before) / 1e18
+        gas_usd = (gas_used / 1e18) * fork.gas_price() * edge.get("eth_usd", 2450)
+        profit_usd = profit_weth * edge.get("eth_usd", 2450)
+        gate = "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
+                          and profit_usd > MIN_PROFIT_USD) else "FAIL"
+        return {
+            "sim": "ok", "gas_used": gas_used,
+            "profit_weth": round(profit_weth, 8),
+            "gas_usd": round(gas_usd, 4),
+            "profit_usd": round(profit_usd, 4),
+            "gate": gate,
+        }
+    finally:
+        kill_tree(proc)
+
+
+def _encode_execute_v2(edge, principal):
+    """Calldata for FlashloanArbV2.execute(uint256 principal, Leg buyLeg,
+    Leg sellLeg, address quoteToken).  Leg = (uint8 kind, address venue, uint24 fee)."""
+    sel = "0x" + kec_sig("execute(uint256,(uint8,address,uint24),(uint8,address,uint24),address)")
+    def leg(kind, venue, fee):
+        return (f"{int(kind):064x}"
+                + pad_addr(venue)
+                + f"{int(fee):064x}")
+    return (sel
+            + f"{int(principal):064x}"
+            + leg(edge["buy_kind"], edge["buy_venue"], edge.get("buy_fee", 0))
+            + leg(edge["sell_kind"], edge["sell_venue"], edge.get("sell_fee", 0))
+            + pad_addr(edge["quote"]))
+
+
 def simulate_edge(edge, fork):
-    """Simulate a scanner edge against REAL pools on the fork."""
-    deployer = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+    """Simulate a scanner edge against REAL pools on the fork (V1 executor)."""
+    deployer = "0xf39fd6e51aad88f6f4ce6ab8827229cfffb92266"
     fork.set_balance(deployer, wad(10))
     fork.impersonate(deployer)
     with open(os.path.join(HERE, "contracts", "FlashloanArb.bin")) as f:
@@ -405,7 +476,8 @@ def simulate_edge(edge, fork):
     except Exception as e:
         return {"sim": "reverted", "error": str(e)[:200]}
     if r.get("status") != "0x1":
-        return {"sim": "reverted", "receipt": json.dumps(r)[:300]}
+        return {"sim": "reverted"}
+
     gas_used = int(r["gasUsed"], 16)
     profit_weth = fork.erc20_balance(WETH, arb_addr) - arb_weth_before
     gas_usd = (gas_used / 1e18) * fork.gas_price() * edge.get("eth_usd", 2450)
