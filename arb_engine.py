@@ -111,28 +111,19 @@ def refresh_token_universe(rpc):
             if t:
                 all_tokens.add(t.lower())
 
-    # Also get token metadata (symbol, decimals) from on-chain calls
+    # Register NEW tokens as short labels ONLY. Do NOT pre-fetch symbol() or
+    # decimals() for every token — that was ~2,500 RPC calls per cycle and the
+    # dominant cost of the 180s scan. token_decimals() resolves lazily (on
+    # first actual use) and caches; symbol fetch was display-only. Curated
+    # tokens (WETH/USDC/...) already carry correct decimals via TOKEN_UNIVERSE.
     for addr in all_tokens:
-        addr = addr if addr.startswith('0x') else '0x' + addr
-        try:
-            # Get decimals via symbol() function
-            d = token_decimals(rpc, addr)
-            # Try to get symbol
-            sym = token_symbol_onchain(rpc, addr)
-            if sym:
-                TOKENS[addr] = {"sym": sym, "decimals": d}
-            else:
-                TOKENS[addr] = {"sym": addr[:6], "decimals": d}
-        except Exception:
-            TOKENS[addr] = {"sym": addr[:6], "decimals": 18}
-
-    # Cache decimals for all discovered tokens
-    for addr in all_tokens:
-        addr_lower = addr if addr.startswith('0x') else '0x' + addr
-        TOKEN_DECIMALS_CACHE[addr_lower] = TOKENS.get(addr_lower, {}).get("decimals", 18)
+        a = addr if addr.startswith('0x') else '0x' + addr
+        if a not in TOKENS:
+            TOKENS[a] = {"sym": a[2:8]}   # no 'decimals' -> resolved lazily
 
     conn.close()
-    print(f"[arb_engine] Token universe refreshed: {len(all_tokens)} unique tokens, {len(TOKENS)} with metadata")
+    print(f"[arb_engine] Token universe: {len(all_tokens)} unique tokens, "
+          f"{len(TOKENS)} registered")
     return all_tokens
 
 def token_decimals(rpc, addr):
@@ -140,9 +131,10 @@ def token_decimals(rpc, addr):
     if addr in TOKEN_DECIMALS_CACHE:
         return TOKEN_DECIMALS_CACHE[addr]
     if addr in TOKENS:
-        d = TOKENS[addr]["decimals"]
-        TOKEN_DECIMALS_CACHE[addr] = d
-        return d
+        d = TOKENS[addr].get("decimals")
+        if d is not None:
+            TOKEN_DECIMALS_CACHE[addr] = d
+            return d
     try:
         r = rpc.eth_call(addr, "0x313ce567")
         d = int(r[2:66], 16) if r and len(r) >= 66 else None
@@ -153,30 +145,105 @@ def token_decimals(rpc, addr):
     TOKEN_DECIMALS_CACHE[addr] = d
     return d
 
+def _abi_string(result):
+    """Decode an ABI-encoded `string` return (offset||len||bytes)."""
+    try:
+        if not result or len(result) < 130:
+            return None
+        h = result[2:]
+        length = int(h[64:128], 16)
+        if length == 0:
+            return ""
+        if len(h) < 128 + length * 2:
+            return None
+        return bytes.fromhex(h[128:128 + length * 2]).decode("utf-8", "ignore").rstrip("\x00")
+    except Exception:
+        return None
+
+
 def token_symbol_onchain(rpc, addr):
-    """Try to get token symbol from name() or symbol() on-chain call."""
+    """Fetch a token's symbol() on-chain (display-only, used lazily)."""
+    SEL_SYMBOL = "0x95d89b41"  # keccak256('symbol()')
     try:
-        # Try symbol call
-        r = rpc.eth_call(addr, "0x06fdde03")  # keccak('symbol()')
-        if r and len(r) >= 66:
-            # Return first 64 bytes decoded as string
-            sym = r[2:66].split("\x00")[0].decode('utf-8', errors='ignore')
-            if sym and len(sym) > 2:
-                return sym
+        return _abi_string(rpc.eth_call(addr, SEL_SYMBOL))
     except Exception:
-        pass
-    # Fallback: try name()
-    try:
-        r = rpc.eth_call(addr, "0x095ea7b3")  # keccak('name()')
-        if r and len(r) >= 66:
-            name = r[2:66].split("\x00")[0].decode('utf-8', errors='ignore')
-            return name.split(" ")[0]  # first word as symbol
-    except Exception:
-        pass
-    return None
+        return None
 
 def token_symbol(addr):
     return TOKENS.get(addr, {}).get("sym", addr[:8])
+
+
+# ---- V2 constant-product quote + CPMM arbitrage math ----------------------
+# (consumed by scan_cross_venue for the V2 legs and by the legacy scan_once
+#  two-pool path)
+
+def cp_out(reserve_in, reserve_out, amount_in, fee_num=997):
+    """Constant-product swap out amount (human-unit floats, fee included)."""
+    if amount_in <= 0:
+        return 0.0
+    ain = amount_in * fee_num / 1000.0
+    return reserve_out * ain / (reserve_in + ain)
+
+
+def price_of(pool, base, quote):
+    """Effective mid price: quote per 1.0 base (human units)."""
+    br, qr = pool_side(pool, base, quote)
+    if br is None or br == 0:
+        return None
+    return human(qr, quote) / human(br, base)
+
+
+def best_two_pool_arb(pool_a, pool_b, base, quote, ref_price):
+    """Numeric scan: buy base->quote on one pool, sell quote->base on the other
+    (both directions). Returns best (direction, size_base, gross_profit_usd)."""
+    best = None
+    for (buy, sell) in ((pool_a, pool_b), (pool_b, pool_a)):
+        b_in_r, b_out_r = pool_side(buy, base, quote)
+        s_in_r, s_out_r = pool_side(sell, quote, base)
+        if not b_in_r or not s_out_r:
+            continue
+        bin_h, bout_h = human(b_in_r, base), human(b_out_r, quote)
+        sin_h, sout_h = human(s_in_r, quote), human(s_out_r, base)
+        if bin_h <= 0 or sin_h <= 0:
+            continue
+        hi = min(bin_h, sout_h) * 0.30
+        for i in range(120):
+            size = hi * (i / 119.0) if i else hi * 1e-4
+            if size <= 0:
+                continue
+            got_quote = cp_out(bin_h, bout_h, size)
+            got_base = cp_out(sin_h, sout_h, got_quote)
+            profit = got_base - size
+            if profit > 0:
+                usd = profit * ref_price
+                if best is None or usd > best[2]:
+                    best = (f"{buy['name']} -> {sell['name']}", size, usd)
+    return best
+
+
+def v2_quote_out(rpc, pool_addr, token_in, token_out, amount_in_raw, q_dec=None):
+    """Exact V2 out by pool ADDRESS using live reserves. RAW integer units in/out.
+
+    `q_dec` is accepted for call-site compatibility but IGNORED: the output
+    amount must be scaled by the OUTPUT token's decimals, never the quote
+    token's (the #1 silent edge-detection killer)."""
+    try:
+        t0 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token0"]))
+        r0_raw, r1_raw = parse_reserves(rpc.eth_call(pool_addr, "0x" + SEL["reserves"]))
+        if t0 is None or r0_raw is None:
+            return None
+        dec_in = token_decimals(rpc, token_in)
+        dec_out = token_decimals(rpc, token_out)
+        in_h = amount_in_raw / 10 ** dec_in
+        if t0 == token_in.lower():
+            rin, rout = r0_raw, r1_raw
+        else:
+            rin, rout = r1_raw, r0_raw
+        ain = in_h * FEE_NUM / 1000.0
+        out_h = (rout / 10 ** dec_out) * ain / ((rin / 10 ** dec_in) + ain)
+        return int(out_h * 10 ** dec_out)
+    except Exception:
+        return None
 
 # ---- cross-venue scan (V2 x V3 via QuoterV2 executable quotes) -----------
 
@@ -216,7 +283,8 @@ def pool_liquidity_cached(rpc, conn, addr):
                 return r[0] if r and r[0] else None
         except Exception:
             pass
-    L = pool_liquidity(rpc, addr)
+    import v3_layer
+    L = v3_layer.pool_liquidity(rpc, addr)
     if L is None:
         L = 0
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -788,8 +856,9 @@ TOKEN_UNIVERSE = {
     "0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a": {"sym": "GMX",  "decimals": 18},
 }
 
-# master token table: universe lookup
-TOKENS = TOKEN_UNIVERSE
+# master token table: universe lookup. COPY, not alias — refresh_token_universe
+# mutates TOKENS at runtime and must not silently grow the curated universe.
+TOKENS = dict(TOKEN_UNIVERSE)
 
 MIN_POOL_USD = 2_000  # a pool must hold >= this (USD side) to count
 MIN_POOL_LIQUIDITY = 1_000  # minimum V3 pool liquidity to count as live
