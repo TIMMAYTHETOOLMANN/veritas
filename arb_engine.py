@@ -687,52 +687,88 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
                                    "venue_buy": buy[0],
                                    "venue_sell": sell[0]})
 
+    # Phase 1: Parallel RPC verification pass (if enabled)
+    if use_parallel and edges:
+        # Re-verify edges across multiple RPC endpoints for failover
+        edges = parallel_scan_edges(edges, rpc)
+
     return edges, report
 
-def parallel_scan_edges(edges_list, rpc_pool, max_workers=4):
-    """Run parallel RPC calls across multiple RPC endpoints to speed up scanning.
+def parallel_scan_edges(edges_list, rpc, max_workers=4):
+    """Re-verify edges across multiple RPC endpoints for failover protection.
 
-    Distributes quoter calls across BROADCAST_RPCS + additional RPCs.
-    Returns updated edges list with more coverage."""
+    Takes a list of edge dicts and re-verifies each one against multiple RPCs.
+    Returns the subset of edges that pass verification on at least 2 RPCs.
+    """
     from core.rpc import RPC
 
-    def single_rpc_call(rpc_url, call_func, *args):
-        """Execute one RPC call on a specific endpoint."""
-        try:
-            r = RPC(rpc_url, timeout=30, retries=2)
-            return call_func(r, *args)
-        except Exception as e:
-            return None
-
-    # Distribute work across RPC endpoints
+    # RPC endpoints for verification
     rpc_urls = [
         "https://arb1.arbitrum.io/rpc",
         "https://arbitrum-one.publicnode.com",
         "https://gateway.tenderly.co/public/arbitrum",
-        "https://rpc.ankur.com/arbitrum",
+        "https://rpc.ankr.com/arbitrum",
         "https://arb-mainnet.g.alchemy.com/v2/",
     ]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all quoter calls in parallel
-        future_to_call = {}
-        for idx, call_data in enumerate(edges_list):
-            rpc_url = rpc_urls[idx % len(rpc_urls)]
-            future = executor.submit(
-                single_rpc_call, rpc_url, *call_data)
-            future_to_call[future] = call_data
+    def verify_edge_on_rpc(edge, rpc_url):
+        """Verify a single edge on a specific RPC endpoint."""
+        try:
+            r = RPC(rpc_url, timeout=30, retries=2)
+            import v3_layer
+            from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
+            
+            buy_kind = edge["buy_kind"]
+            sell_kind = edge["sell_kind"]
+            buy_venue = edge["buy_venue"]
+            sell_venue = edge["sell_venue"]
+            buy_fee = edge["buy_fee"]
+            sell_fee = edge["sell_fee"]
+            quote = edge["quote"]
+            size = edge["size_weth"]
+            
+            amt = int(size * 1e18)
+            q_dec = arb_engine.token_decimals(r, quote)
+            
+            # Verify buy leg
+            if buy_kind == 1:  # V3
+                mid = v3_layer.quote_v3(r, arb_engine.WETH, quote, amt, buy_fee, from_addr)
+            else:  # V2
+                mid = arb_engine.v2_quote_out(r, buy_venue, arb_engine.WETH, quote, amt, q_dec=q_dec)
+            
+            if not mid or mid == 0:
+                return False
+            
+            # Verify sell leg
+            if sell_kind == 1:  # V3
+                back = v3_layer.quote_v3(r, quote, arb_engine.WETH, mid, sell_fee, from_addr)
+            else:  # V2
+                back = arb_engine.v2_quote_out(r, sell_venue, quote, arb_engine.WETH, mid, q_dec=q_dec)
+            
+            if not back or back == 0:
+                return False
+            
+            profit_weth = (back - amt) / 1e18
+            return profit_weth > 0
+        except Exception:
+            return False
 
-        # Collect results as they complete
-        for future in concurrent.futures.as_completed(future_to_call):
-            call_data = future_to_call[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    pass  # result already applied in the call path
-            except Exception as e:
-                print(f"[arb_engine] parallel call failed: {e}")
-
-    return edges_list
+    # Verify each edge across multiple RPCs
+    verified_edges = []
+    for edge in edges_list:
+        verified_count = 0
+        # Test on up to 3 RPCs for speed
+        test_rpcs = rpc_urls[:3]
+        for rpc_url in test_rpcs:
+            if verify_edge_on_rpc(edge, rpc_url):
+                verified_count += 1
+        
+        # Edge passes if at least 2 RPCs verify it
+        if verified_count >= 2:
+            edge["verified_rpcs"] = verified_count
+            verified_edges.append(edge)
+    
+    return verified_edges
 
 # ---- ENHANCED ONCE ------------------------------------------------------
 

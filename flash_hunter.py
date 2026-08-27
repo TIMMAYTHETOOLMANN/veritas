@@ -204,9 +204,11 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
     gas_wei = uint_or_zero(r.call("eth_gasPrice", []))
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     try:
-        edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
-                                                     size_steps=12,
-                                                     max_venues_per_quote=8)
+            edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
+                                                         size_steps=12,
+                                                         max_venues_per_quote=8,
+                                                         use_multi_hop=True,
+                                                         use_parallel=True)
     except Exception as e:
         print(f"[hunter] registry scan failed: {e}", flush=True)
         log_event({"event": "scan_error", "error": str(e)[:200]})
