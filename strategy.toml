@@ -1,0 +1,28 @@
+[system]
+name = "VERITAS_Controller"
+queue_db_path = "veritas_queue.db"
+
+[model]
+# We'll plug the actual model later. Worker just calls this interface.
+backend = "mock" # Options: mock, ollama, llama_cpp, openai
+model_path = "models/smollm-1.7b-q4.gguf"
+ollama_model = "smollm2:1.7b"
+context_length = 4096
+
+[tasks.gas_watcher]
+description = "Check L1/L2 gas and adjust multiplier if needed"
+schedule_hint = "every 2m"
+timeout_seconds = 15
+max_retries = 2
+
+[tasks.edge_scanner]
+description = "Run parallel_scan_edges() and log top 3 opportunities"
+schedule_hint = "every 5m"
+timeout_seconds = 30
+max_retries = 3
+
+[tasks.health_check]
+description = "Verify RPC, Anvil, and Executor V2 responsiveness"
+schedule_hint = "every 15m"
+timeout_seconds = 10
+max_retries = 1
