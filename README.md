@@ -27,11 +27,29 @@ archive/logs/          Historical census/sentinel logs
 
 ## Operations
 
-- Run engine:    `python3 flash_hunter.py --run` (180s cycles)
+- Run engine:    `python3 flash_hunter.py --run` (target 180s cadence;
+                 sleep covers only the remainder after each cycle's work)
+- Tune cadence:  `python3 flash_hunter.py --run --interval 150`
 - Heartbeat:     `python3 heartbeat_monitor.py`
 - Pool census:   `python3 pool_registry.py` (auto-resumes from DB)
 - Watchdogs (cron): ec2016bb9a90 (engine restart, */30) +
                     735a11892875 (self-heal health, */30, alerts on degrade)
+
+## Hunt pipeline (2026-08-27 throughput overhaul)
+
+Every cycle (~3 min): scan → cross-RPC confirmation → batch fork-sim →
+broadcast best PASS. Every cycle writes a vetted result to
+`vetted_targets.jsonl` (top candidates, sim verdicts, broadcast status).
+
+- Scan: V2 pool-state cache (4s TTL) + 5s quoter cache → ~10x fewer RPC calls
+- Confirmation: edges re-verified on 3 RPCs in parallel (2-of-3 vote);
+  the old serial pass had a NameError that silently dropped EVERY edge
+- Vet: ONE anvil fork per cycle, evm_snapshot/evm_revert between sims,
+  up to 4 edges per cycle, best-net first
+- Cadence: elapsed-based sleep keeps the loop on the 180s target
+- Scan RPC rotates each cycle to dodge per-endpoint rate limits
+- 3-pool multi-hop removed: zero-reserve dead code; the 2-leg executor
+  cannot execute 3-pool routes anyway
 
 ## Rules
 

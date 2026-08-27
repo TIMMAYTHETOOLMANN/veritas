@@ -30,6 +30,7 @@ import sim_gate
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "flash_hunter.log")
+TARGETS_FILE = os.path.join(HERE, "vetted_targets.jsonl")
 EXECUTOR_FILE = os.path.join(HERE, ".executor_address")
 EXECUTOR_V2_FILE = os.path.join(HERE, ".executor_v2_address")
 
@@ -42,12 +43,13 @@ BROADCAST_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
-SCAN_INTERVAL_SEC = 180      # cross-venue quoter scan is ~2 min
+SCAN_INTERVAL_SEC = 180      # TARGET cadence: one full hunt cycle every 3 min
 HEARTBEAT_EVERY_SEC = 15 * 60
 GAS_MULTIPLIER = 2           # profit must exceed 2x gas (was 3, too tight)
 MIN_PROFIT_USD = 0.05        # allow sub-$0.50 edges (gas is ~$0.02)
 V3_ROUTER = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
 SWEEP_THRESHOLD_WETH = 0.001  # auto-sweep profit above this to hot wallet
+SIM_BUDGET_PER_CYCLE = 4     # max fork-sims per cycle (best-net first)
 
 
 class Rpc:
@@ -181,7 +183,9 @@ def gas_usd_of(gas_price_wei, gas_used, eth_usd=2450.0):
 
 
 def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
-    """One hunt cycle: registry cross-venue scan -> sim candidates -> broadcast if gate passes."""
+    """One hunt cycle: registry cross-venue scan -> batch fork-sim vetting
+    -> broadcast the best PASSING edge. Returns a cycle summary dict."""
+    cycle_start = time.time()
     from core.rpc import RPC as Vrpc
     import v3_layer
     r = Vrpc(rpc_scan, timeout=120, retries=3)
@@ -204,11 +208,11 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
     gas_wei = uint_or_zero(r.call("eth_gasPrice", []))
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     try:
-            edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
-                                                         size_steps=12,
-                                                         max_venues_per_quote=8,
-                                                         use_multi_hop=True,
-                                                         use_parallel=True)
+        edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
+                                                    size_steps=12,
+                                                    max_venues_per_quote=8,
+                                                    use_multi_hop=False,
+                                                    use_parallel=True)
     except Exception as e:
         print(f"[hunter] registry scan failed: {e}", flush=True)
         log_event({"event": "scan_error", "error": str(e)[:200]})
@@ -220,26 +224,67 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
                "combos": len(report), "edges": len(edges),
                "eth_usd": round(eth_usd, 2)})
     if not edges:
-        return None
-    for edge in edges:
-        sim_input = {
-            "size_weth": edge["size_weth"],
-            "buy_kind": edge["buy_kind"], "buy_venue": edge["buy_venue"],
-            "buy_fee": edge["buy_fee"],
-            "sell_kind": edge["sell_kind"], "sell_venue": edge["sell_venue"],
-            "sell_fee": edge["sell_fee"],
-            "quote": edge["quote"],
-            "eth_usd": eth_usd,
-        }
-        print(f"[hunter] EDGE -> simulating: {edge}", flush=True)
-        sim = simulate_edge_v2(sim_input, acct, executor_addr)
+        summary = {"edges": 0, "sims": 0, "passes": 0, "broadcast": None,
+                   "elapsed_sec": round(time.time() - cycle_start, 1)}
+        write_cycle_report(summary, [])
+        if verbose:
+            print(f"[{time.strftime('%H:%M:%S')}] cycle done: 0 vetted edges "
+                  f"({summary['elapsed_sec']}s)", flush=True)
+        return summary
+
+    # edges arrive sorted by net_usd (best first) from arb_engine;
+    # stamp live ETH price so fork-sim USD profit/gas math is exact
+    for e in edges:
+        e["eth_usd"] = eth_usd
+    sim_results = simulate_edges_batch(edges, acct, executor_addr)
+
+    receipt = None
+    passes = 0
+    for edge, sim in sim_results:
         log_event({"event": "sim", "edge": edge, "sim": sim})
         if sim and sim.get("gate") == "PASS":
-            print(f"[hunter] SIM PASS -> broadcasting: {sim}", flush=True)
-            receipt = broadcast_and_verify_v2(rpc, acct, executor_addr, sim_input)
+            passes += 1
+            print(f"[hunter] SIM PASS (${sim.get('profit_usd')} net) "
+                  f"-> broadcasting: {edge.get('venue_buy')} -> "
+                  f"{edge.get('venue_sell')} size={edge.get('size_weth')} WETH",
+                  flush=True)
+            receipt = broadcast_and_verify_v2(rpc, acct, executor_addr, edge)
             log_event({"event": "broadcast", "receipt": receipt})
-            return receipt
-    return None
+            break   # one live shot per cycle; next cycle re-scans fresh state
+
+    summary = {"edges": len(edges), "sims": len(sim_results),
+               "passes": passes, "broadcast": receipt,
+               "elapsed_sec": round(time.time() - cycle_start, 1)}
+    write_cycle_report(summary, sim_results)
+    if verbose:
+        print(f"[{time.strftime('%H:%M:%S')}] cycle done: {len(edges)} edges, "
+              f"{len(sim_results)} simmed, {passes} PASS, "
+              f"broadcast={'ok' if receipt and receipt.get('broadcast') == 'ok' else 'none'} "
+              f"({summary['elapsed_sec']}s)", flush=True)
+    return summary
+
+
+def write_cycle_report(summary, sim_results):
+    """Every cycle produces a concrete, vetted result on disk — the
+    3-minute deliverable: top candidates, sim verdicts, broadcast status."""
+    rec = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **summary,
+        "vetted": [
+            {"pair": e.get("pair"),
+             "net_usd": e.get("net_usd"),
+             "size_weth": e.get("size_weth"),
+             "buy": e.get("venue_buy"), "sell": e.get("venue_sell"),
+             "verified_rpcs": e.get("verified_rpcs"),
+             "sim": (s or {}).get("gate", "not_simmed")}
+            for e, s in sim_results
+        ],
+    }
+    try:
+        with open(TARGETS_FILE, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
 
 
 def uint_or_zero(x):
@@ -262,38 +307,68 @@ def encode_execute_v2(plan):
             + plan["quote"][2:].rjust(64, "0"))
 
 
-def simulate_edge_v2(edge, acct, executor_addr):
-    """Fork-sim the exact cross-venue live tx (anvil fork, real pools)."""
+def simulate_edges_batch(edges, acct, executor_addr, max_sims=SIM_BUDGET_PER_CYCLE):
+    """Vet up to max_sims edges against ONE anvil fork using
+    evm_snapshot/evm_revert between sims (each edge sees pristine pool
+    state). Returns [(edge, sim_result), ...] in priority order; stops at
+    the first PASS (edges are pre-sorted by net_usd)."""
+    results = []
     proc, host, head, fork_url = sim_gate.launch_fork()
     try:
         fork = sim_gate.Fork(host)
         fork.set_balance(HOT_WALLET, 10 ** 18)
         fork.impersonate(HOT_WALLET)
-        data = encode_execute_v2(edge)
-        weth_before = fork.erc20_balance(sim_gate.WETH, executor_addr)
-        try:
-            txh = fork.send_from(HOT_WALLET, executor_addr, data)
-            r = fork.wait_tx(txh)
-        except Exception as e:
-            return {"sim": "reverted", "error": str(e)[:200]}
-        if r.get("status") != "0x1":
-            return {"sim": "reverted"}
-        gas_used = int(r["gasUsed"], 16)
-        profit_weth = (fork.erc20_balance(sim_gate.WETH, executor_addr)
-                       - weth_before) / 1e18
-        profit_usd = profit_weth * edge.get("eth_usd", 2450)
-        gas_usd = (gas_used / 1e9) * (fork.gas_price() / 1e9) * edge.get("eth_usd", 2450)
-        gate = "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
-                          and profit_usd > MIN_PROFIT_USD) else "FAIL"
-        return {
-            "sim": "ok", "gas_used": gas_used,
-            "profit_weth": round(profit_weth, 8),
-            "gas_usd": round(gas_usd, 4),
-            "profit_usd": round(profit_usd, 4),
-            "gate": gate,
-        }
+        for edge in edges[:max_sims]:
+            print(f"[hunter] EDGE -> fork-simming: {edge.get('venue_buy')} -> "
+                  f"{edge.get('venue_sell')} size={edge.get('size_weth')} "
+                  f"net=${edge.get('net_usd')}", flush=True)
+            snap = None
+            try:
+                snap = fork.snapshot()
+            except Exception:
+                pass  # snapshot is an optimization, not a requirement
+            try:
+                sim = sim_edge_on_fork(fork, edge, executor_addr)
+            except Exception as e:
+                sim = {"sim": "error", "error": str(e)[:200]}
+            results.append((edge, sim))
+            if sim and sim.get("gate") == "PASS":
+                break
+            if snap is not None:
+                try:
+                    fork.revert(snap)
+                except Exception:
+                    pass
     finally:
         sim_gate.kill_tree(proc)
+    return results
+
+
+def sim_edge_on_fork(fork, edge, executor_addr):
+    """Fork-sim the exact cross-venue live tx on an already-running fork."""
+    data = encode_execute_v2(edge)
+    weth_before = fork.erc20_balance(sim_gate.WETH, executor_addr)
+    try:
+        txh = fork.send_from(HOT_WALLET, executor_addr, data)
+        r = fork.wait_tx(txh)
+    except Exception as e:
+        return {"sim": "reverted", "error": str(e)[:200]}
+    if r.get("status") != "0x1":
+        return {"sim": "reverted"}
+    gas_used = int(r["gasUsed"], 16)
+    profit_weth = (fork.erc20_balance(sim_gate.WETH, executor_addr)
+                   - weth_before) / 1e18
+    profit_usd = profit_weth * edge.get("eth_usd", 2450)
+    gas_usd = (gas_used / 1e9) * (fork.gas_price() / 1e9) * edge.get("eth_usd", 2450)
+    gate = "PASS" if (profit_usd > GAS_MULTIPLIER * gas_usd
+                      and profit_usd > MIN_PROFIT_USD) else "FAIL"
+    return {
+        "sim": "ok", "gas_used": gas_used,
+        "profit_weth": round(profit_weth, 8),
+        "gas_usd": round(gas_usd, 4),
+        "profit_usd": round(profit_usd, 4),
+        "gate": gate,
+    }
 
 
 def broadcast_and_verify_v2(rpc, acct, executor_addr, plan):
@@ -390,6 +465,8 @@ def main():
     ap.add_argument("--once", action="store_true",
                     help="single cycle then exit (for cron watchdog)")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--interval", type=int, default=SCAN_INTERVAL_SEC,
+                    help="target seconds between hunt cycles (default 180)")
     args = ap.parse_args()
 
     acct = Account.from_key(load_key())
@@ -421,16 +498,22 @@ def main():
             log_event({"event": "error", "mode": "once", "error": str(e)[:200]})
         return
 
-    # hunt loop
+    # hunt loop — TARGET cadence: a full hunt cycle (scan -> vet -> shoot)
+    # every --interval seconds. The sleep only covers the REMAINDER of the
+    # interval after the cycle's work, so a 2-min scan still lands on a
+    # 3-minute cadence instead of drifting to 5-6 minutes.
     print(f"[hunter] hunting. executor={executor_addr} "
-          f"interval={SCAN_INTERVAL_SEC}s gate=profit>{GAS_MULTIPLIER}x gas "
+          f"interval={args.interval}s gate=profit>{GAS_MULTIPLIER}x gas "
           f"min=${MIN_PROFIT_USD}")
     last_hb = 0.0
     cycle = 0
     while True:
         cycle += 1
+        cycle_start = time.time()
         try:
-            hunt_once(rpc, acct, executor_addr, BROADCAST_RPCS[0])
+            # rotate the scan RPC each cycle to dodge per-endpoint rate limits
+            scan_url = BROADCAST_RPCS[(cycle - 1) % len(BROADCAST_RPCS)]
+            hunt_once(rpc, acct, executor_addr, scan_url)
             try:
                 sweep_executor_v2(rpc, acct, executor_addr)
             except Exception as e:
@@ -449,7 +532,8 @@ def main():
                            "executor_weth": weth})
         except Exception as e:
             print(f"[hunter] heartbeat error (non-fatal): {e}", flush=True)
-        time.sleep(SCAN_INTERVAL_SEC)
+        elapsed = time.time() - cycle_start
+        time.sleep(max(5, args.interval - elapsed))
 
 
 if __name__ == "__main__":

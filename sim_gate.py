@@ -185,6 +185,14 @@ class Fork:
     def mine(self):
         self.req("evm_mine", [])
 
+    def snapshot(self):
+        """Snapshot chain state; returns snapshot id for revert()."""
+        return self.req("evm_snapshot", [])
+
+    def revert(self, snap_id):
+        """Revert to a snapshot (restores exact pre-sim pool state)."""
+        return self.req("evm_revert", [snap_id])
+
     def send_from(self, frm, to, data, value=0):
         # impersonation send (anvil auto-gas)
         return self.req("eth_sendTransaction", [{

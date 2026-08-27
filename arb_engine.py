@@ -100,8 +100,16 @@ def refresh_token_universe(rpc):
     Replaces the hardcoded 8-token universe with 834+ tokens."""
     import sqlite3
     DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "veritas.db")
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.execute("PRAGMA busy_timeout=30000")
+    if not os.path.isfile(DB):
+        print("[arb_engine] veritas.db missing — run pool_registry.py first; "
+              "using curated universe only")
+        return set(TOKENS)
+    try:
+        conn = sqlite3.connect(DB, timeout=30)
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception as e:
+        print(f"[arb_engine] veritas.db unreadable ({e}) — using curated universe")
+        return set(TOKENS)
 
     # Collect all unique token addresses from the pool registry
     rows = conn.execute('SELECT DISTINCT token0, token1 FROM pools').fetchall()
@@ -221,6 +229,30 @@ def best_two_pool_arb(pool_a, pool_b, base, quote, ref_price):
     return best
 
 
+# ---- V2 pool-state cache (scan-cycle scoped) ------------------------------
+# v2_quote_out is called 12+ times per pool per scan (size steps x
+# directions). Without a cache that is 2 eth_calls per quote — the dominant
+# RPC cost of the scan. Reserves are cached for V2_CACHE_TTL seconds; the
+# fork-sim gate re-verifies every edge against live state anyway, so a few
+# seconds of staleness here costs nothing and buys a ~10x faster scan.
+_v2_pool_cache = {}          # pool_addr -> (token0, r0_raw, r1_raw, ts)
+V2_CACHE_TTL = 4.0           # seconds
+
+def _v2_pool_state(rpc, pool_addr):
+    """(token0, r0_raw, r1_raw) with a short TTL cache."""
+    now = time.time()
+    hit = _v2_pool_cache.get(pool_addr)
+    if hit and now - hit[3] < V2_CACHE_TTL:
+        return hit[0], hit[1], hit[2]
+    t0 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token0"]))
+    r0_raw, r1_raw = parse_reserves(rpc.eth_call(pool_addr, "0x" + SEL["reserves"]))
+    if t0 is None or r0_raw is None:
+        return None, None, None
+    _v2_pool_cache[pool_addr] = (t0, r0_raw, r1_raw, now)
+    if len(_v2_pool_cache) > 2000:   # bound memory
+        _v2_pool_cache.clear()
+    return t0, r0_raw, r1_raw
+
 def v2_quote_out(rpc, pool_addr, token_in, token_out, amount_in_raw, q_dec=None):
     """Exact V2 out by pool ADDRESS using live reserves. RAW integer units in/out.
 
@@ -228,8 +260,7 @@ def v2_quote_out(rpc, pool_addr, token_in, token_out, amount_in_raw, q_dec=None)
     amount must be scaled by the OUTPUT token's decimals, never the quote
     token's (the #1 silent edge-detection killer)."""
     try:
-        t0 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token0"]))
-        r0_raw, r1_raw = parse_reserves(rpc.eth_call(pool_addr, "0x" + SEL["reserves"]))
+        t0, r0_raw, r1_raw = _v2_pool_state(rpc, pool_addr)
         if t0 is None or r0_raw is None:
             return None
         dec_in = token_decimals(rpc, token_in)
@@ -612,53 +643,10 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
                             best = (size, mid, profit_weth)
                             best_dir = (b_buy, b_sell)
 
-                # --- MULTI-HOP: 3-pool triangular arb ---
-                if use_multi_hop and best is None:
-                    # Find a third pool to complete the triangle
-                    for k in range(len(venues)):
-                        if k == i or k == j:
-                            continue
-                        third = venues[k]
-                        # Check if third pool can complete the triangle
-                        try:
-                            pool_dicts = []
-                            for v_idx, v in enumerate([buy, sell, third]):
-                                if v[1] == 1:  # V3
-                                    pool_dicts.append({
-                                        "name": v[0],
-                                        "address": v[2],
-                                        "token0": WETH,
-                                        "token1": quote,
-                                        "r0": 0,
-                                        "r1": 0,
-                                        "quote": quote,
-                                        "weth_reserve": 0,
-                                        "quote_reserve": 0,
-                                        "usd_depth": v[4],
-                                    })
-                                else:  # V2
-                                    pool_dicts.append({
-                                        "name": v[0],
-                                        "address": v[2],
-                                        "token0": WETH,
-                                        "token1": quote,
-                                        "r0": 0,
-                                        "r1": 0,
-                                        "quote": quote,
-                                        "weth_reserve": 0,
-                                        "quote_reserve": 0,
-                                        "usd_depth": v[4],
-                                    })
-
-                            result = best_three_pool_arb(
-                                pool_dicts[0], pool_dicts[1], pool_dicts[2],
-                                WETH, quote, eth_usd)
-                            if result:
-                                best = (size, mid, profit_weth) if best is None else best
-                                best_dir = ('multi_hop',)
-                                break
-                        except Exception:
-                            continue
+                # NOTE: 3-pool multi-hop was removed — it built pool dicts
+                # with zero reserves (could never fire), referenced undefined
+                # variables, and the FlashloanArbV2 executor only supports
+                # 2 legs, so any 3-pool route is unexecutable anyway.
 
                 if best and best_dir:
                     size, mid, profit = best
@@ -687,10 +675,12 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
                                    "venue_buy": buy[0],
                                    "venue_sell": sell[0]})
 
-    # Phase 1: Parallel RPC verification pass (if enabled)
+    # Cross-RPC confirmation pass (vetted targets only)
     if use_parallel and edges:
-        # Re-verify edges across multiple RPC endpoints for failover
         edges = parallel_scan_edges(edges, rpc)
+
+    # Best opportunities first — the hunter sims/broadcasts in list order
+    edges.sort(key=lambda e: e.get("net_usd", 0), reverse=True)
 
     return edges, report
 
@@ -702,22 +692,21 @@ def parallel_scan_edges(edges_list, rpc, max_workers=4):
     """
     from core.rpc import RPC
 
-    # RPC endpoints for verification
+    # RPC endpoints for verification (public, no key required).
+    # The old list contained a keyless Alchemy URL that always 401'd.
     rpc_urls = [
         "https://arb1.arbitrum.io/rpc",
         "https://arbitrum-one.publicnode.com",
         "https://gateway.tenderly.co/public/arbitrum",
-        "https://rpc.ankr.com/arbitrum",
-        "https://arb-mainnet.g.alchemy.com/v2/",
     ]
 
     def verify_edge_on_rpc(edge, rpc_url):
         """Verify a single edge on a specific RPC endpoint."""
         try:
-            r = RPC(rpc_url, timeout=30, retries=2)
+            r = RPC(rpc_url, timeout=15, retries=1)
             import v3_layer
             from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
-            
+
             buy_kind = edge["buy_kind"]
             sell_kind = edge["sell_kind"]
             buy_venue = edge["buy_venue"]
@@ -726,48 +715,56 @@ def parallel_scan_edges(edges_list, rpc, max_workers=4):
             sell_fee = edge["sell_fee"]
             quote = edge["quote"]
             size = edge["size_weth"]
-            
+
             amt = int(size * 1e18)
-            q_dec = arb_engine.token_decimals(r, quote)
-            
+            q_dec = token_decimals(r, quote)
+
             # Verify buy leg
             if buy_kind == 1:  # V3
-                mid = v3_layer.quote_v3(r, arb_engine.WETH, quote, amt, buy_fee, from_addr)
+                mid = v3_layer.quote_v3(r, WETH, quote, amt, buy_fee, from_addr)
             else:  # V2
-                mid = arb_engine.v2_quote_out(r, buy_venue, arb_engine.WETH, quote, amt, q_dec=q_dec)
-            
+                mid = v2_quote_out(r, buy_venue, WETH, quote, amt, q_dec=q_dec)
+
             if not mid or mid == 0:
                 return False
-            
+
             # Verify sell leg
             if sell_kind == 1:  # V3
-                back = v3_layer.quote_v3(r, quote, arb_engine.WETH, mid, sell_fee, from_addr)
+                back = v3_layer.quote_v3(r, quote, WETH, mid, sell_fee, from_addr)
             else:  # V2
-                back = arb_engine.v2_quote_out(r, sell_venue, quote, arb_engine.WETH, mid, q_dec=q_dec)
-            
+                back = v2_quote_out(r, sell_venue, quote, WETH, mid, q_dec=q_dec)
+
             if not back or back == 0:
                 return False
-            
+
             profit_weth = (back - amt) / 1e18
             return profit_weth > 0
         except Exception:
             return False
 
-    # Verify each edge across multiple RPCs
+    # Verify each edge across 3 RPCs IN PARALLEL (was serial: 3 round-trips
+    # per edge made the verification pass the slowest stage of the cycle).
     verified_edges = []
-    for edge in edges_list:
-        verified_count = 0
-        # Test on up to 3 RPCs for speed
-        test_rpcs = rpc_urls[:3]
-        for rpc_url in test_rpcs:
-            if verify_edge_on_rpc(edge, rpc_url):
-                verified_count += 1
-        
-        # Edge passes if at least 2 RPCs verify it
-        if verified_count >= 2:
-            edge["verified_rpcs"] = verified_count
-            verified_edges.append(edge)
-    
+    if edges_list:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {}
+            for idx, edge in enumerate(edges_list):
+                for rpc_url in rpc_urls[:3]:
+                    futures[(idx, rpc_url)] = pool.submit(
+                        verify_edge_on_rpc, edge, rpc_url)
+            votes = {}
+            for (idx, _url), fut in futures.items():
+                try:
+                    ok = fut.result(timeout=45)
+                except Exception:
+                    ok = False
+                votes[idx] = votes.get(idx, 0) + (1 if ok else 0)
+        for idx, edge in enumerate(edges_list):
+            # Edge is CONFIRMED if at least 2 of 3 independent RPCs verify it
+            if votes.get(idx, 0) >= 2:
+                edge["verified_rpcs"] = votes[idx]
+                verified_edges.append(edge)
+
     return verified_edges
 
 # ---- ENHANCED ONCE ------------------------------------------------------
