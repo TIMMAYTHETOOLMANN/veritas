@@ -20,7 +20,7 @@ class ModelGateway:
             from flash_hunter import hunt_once
             return {
                 "scan_edges": parallel_scan_edges,
-                "hunt_once": hunt_once,
+                "primary_hunt": hunt_once,
                 "three_pool": best_three_pool_arb,
                 "scan_cross_venue": scan_cross_venue,
             }
@@ -29,28 +29,34 @@ class ModelGateway:
             return {}
 
     def _run_with_timeout(self, func: Callable, timeout: int, *args, **kwargs):
-        """Run a function with a timeout. Kills it if it hangs."""
-        def wrapper():
-            return func(*args, **kwargs)
+        """Run a function with a timeout. On Unix uses signal, on Windows runs without timeout (with warning)."""
+        # Check if signal.SIGALRM is available (Unix/Linux/macOS)
+        if hasattr(signal, 'SIGALRM'):
+            def wrapper():
+                return func(*args, **kwargs)
 
-        def timeout_handler(signum, frame):
-            raise TimeoutError(f"Function {func.__name__} exceeded {timeout}s")
-        
-        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(timeout)
-        try:
-            result = wrapper()
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-            return result
-        except TimeoutError as e:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-            raise e
-        except Exception as e:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-            raise e
+            def timeout_handler(signum, frame):
+                raise TimeoutError(f"Function {func.__name__} exceeded {timeout}s")
+            
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout)
+            try:
+                result = wrapper()
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+                return result
+            except TimeoutError as e:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+                raise e
+            except Exception as e:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+                raise e
+        else:
+            # Windows or other platforms without SIGALRM: run without timeout
+            logger.warning(f"Platform does not support SIGALRM; running {func.__name__} without timeout.")
+            return func(*args, **kwargs)
 
     def execute(self, task_type: str, payload: Dict, timeout: int = 30) -> Dict[str, Any]:
         """The main execution switch."""
@@ -79,6 +85,54 @@ class ModelGateway:
             # Generic health check: test RPC connectivity (mock logic)
             try:
                 return {"status": "success", "data": {"anvil": "live", "rpc": "responsive", "executor": "deployed"}}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        elif task_type == "primary_hunt":
+            try:
+                # Import necessary modules and set up the environment
+                from eth_account import Account
+                from flash_hunter import Rpc, load_key, BROADCAST_RPCS, HOT_WALLET, load_executor
+                import os
+
+                # Set up RPC for scanning and broadcasting (we can use the same for simplicity)
+                rpc_scan = Rpc(BROADCAST_RPCS[0])  # Using the first broadcast RPC for scanning
+                # For the hunter's main RPC, we can use the same or a different one. We'll use the same.
+                rpc = rpc_scan
+
+                # Load account
+                SECRET_FILE = os.path.join(os.path.dirname(__file__), ".hot_secret")
+                with open(SECRET_FILE) as f:
+                    key = f.read().strip()
+                acct = Account.from_key(key)
+                # Verify address (optional, but we can skip for speed)
+
+                # Load executor address
+                executor_addr = load_executor()
+                if not executor_addr:
+                    return {"status": "error", "error": "Executor not deployed. Please deploy first."}
+
+                # Get the hunt_once function from the tool registry
+                hunt_once_func = self.tool_registry.get("primary_hunt")
+                if hunt_once_func is None:
+                    return {"status": "error", "error": "primary_hunt tool not loaded"}
+
+                # Now call hunt_once_func
+                result = self._run_with_timeout(
+                    hunt_once_func, 
+                    timeout, 
+                    rpc, 
+                    acct, 
+                    executor_addr, 
+                    rpc_scan, 
+                    False  # verbose=False
+                )
+
+                if result is None:
+                    return {"status": "success", "data": {"message": "No opportunity found in this cycle."}}
+                else:
+                    return {"status": "success", "data": result}
+
             except Exception as e:
                 return {"status": "error", "error": str(e)}
 

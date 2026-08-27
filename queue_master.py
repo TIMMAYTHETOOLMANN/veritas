@@ -122,12 +122,13 @@ class QueueMaster:
         """Safety net: tasks stuck in 'running' for too long get reverted to pending."""
         cutoff = datetime.utcnow() - timedelta(seconds=timeout_seconds)
         with sqlite3.connect(self.db_path, timeout=30) as conn:
-            conn.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 UPDATE tasks 
                 SET status = 'pending', started_at = NULL, attempt_count = attempt_count + 1
                 WHERE status = 'running' AND started_at < ?
             """, (cutoff,))
-            affected = conn.rowcount
+            affected = cursor.rowcount
             conn.commit()
             if affected:
                 logger.warning(f"Reaped {affected} stale running tasks.")

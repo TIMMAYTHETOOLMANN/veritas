@@ -26,3 +26,9 @@ description = "Verify RPC, Anvil, and Executor V2 responsiveness"
 schedule_hint = "every 15m"
 timeout_seconds = 10
 max_retries = 1
+
+[tasks.primary_hunt]
+description = "Full arbitrage discovery and execution cycle"
+schedule_hint = "every 2m"
+timeout_seconds = 180
+max_retries = 2
