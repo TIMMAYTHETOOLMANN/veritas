@@ -1,67 +1,101 @@
-"""hermes_api.py — HTTP bridge for the Hermes Agent "Bots" tab.
-
-Hermes Bots POST cron triggers here; this drops them into the SQLite queue and
-returns 202 Accepted immediately. The worker consumes them asynchronously.
-
-Endpoints:
-  POST /api/v1/task             -> enqueue {task_type, payload, priority, max_retries}
-  GET  /api/v1/task/{task_id}   -> task status
-  GET  /api/v1/health           -> liveness
-"""
-import os
-import logging
-from typing import Optional, Dict, Any
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
 import toml
+import uvicorn
+import sqlite3
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import logging
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from queue_master import QueueMaster
+from model_gateway import ModelGateway
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "strategy.toml")
+app = FastAPI(title="VERITAS Controller API", version="0.1.0")
 
-config = toml.load(CONFIG_PATH)
-queue = QueueMaster(config["system"]["queue_db_path"])
+# Load configuration
+CONFIG = toml.load("strategy.toml")
+queue = QueueMaster(CONFIG['system']['queue_db_path'])
+gateway = ModelGateway(CONFIG['model'])
 
-app = FastAPI(title="VERITAS Hermes Bridge")
-
-
-class TaskPayload(BaseModel):
+# Pydantic models for API
+class TaskCreate(BaseModel):
     task_type: str
-    payload: Optional[Dict[str, Any]] = {}
-    priority: Optional[int] = 0
-    max_retries: Optional[int] = 3
+    payload: Dict[str, Any]
+    priority: int = 0
 
+class TaskResponse(BaseModel):
+    task_id: str
+    status: str
+    detail: Optional[str] = None
 
-@app.post("/api/v1/task", status_code=202)
-async def submit_task(task: TaskPayload):
-    """Hermes Bots POST here. Example: {"task_type": "edge_scanner", "payload": {"limit": 5}}"""
+class TaskStatusResponse(BaseModel):
+    id: str
+    task_type: str
+    payload: Dict[str, Any]
+    status: str
+    priority: int
+    created_at: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    attempt_count: int
+    max_retries: int
+    result: Optional[Dict] = None
+    error: Optional[str] = None
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("VERITAS API started.")
+
+@app.get("/")
+async def root():
+    return {"message": "VERITAS Controller API is running."}
+
+@app.post("/tasks", response_model=TaskResponse)
+async def create_task(task: TaskCreate, background_tasks: BackgroundTasks):
     task_id = queue.enqueue(
         task_type=task.task_type,
-        payload=task.payload or {},
-        priority=task.priority,
-        max_retries=task.max_retries,
+        payload=task.payload,
+        priority=task.priority
     )
-    return {"status": "accepted", "task_id": task_id, "message": "Task queued for execution"}
+    return TaskResponse(task_id=task_id, status="pending", detail="Task enqueued.")
 
-
-@app.get("/api/v1/task/{task_id}")
+@app.get("/tasks/{task_id}", response_model=TaskStatusResponse)
 async def get_task_status(task_id: str):
-    status = queue.get_status(task_id)
-    if not status:
+    task = queue.get_status(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return status
+    return TaskStatusResponse(**task)
 
+@app.get("/tasks", response_model=list[TaskStatusResponse])
+async def list_tasks(limit: int = 50):
+    # For simplicity, we'll fetch all and limit in memory. In production, use pagination.
+    with sqlite3.connect(queue.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [TaskStatusResponse(**dict(row)) for row in rows]
 
-@app.get("/api/v1/health")
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    with sqlite3.connect(queue.db_path) as conn:
+        conn.execute("UPDATE tasks SET status = 'cancelled' WHERE id = ? AND status = 'pending'", (task_id,))
+        conn.commit()
+    return {"message": f"Task {task_id} cancelled if it was pending."}
+
+@app.get("/health")
 async def health_check():
-    return {"status": "operational", "queue": "active", "pending": queue.pending_count()}
-
+    # Simple health check: can we touch the DB?
+    try:
+        with sqlite3.connect(queue.db_path) as conn:
+            conn.execute("SELECT 1")
+        return {"status": "healthy"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run("hermes_api:app", host="0.0.0.0", port=8000, reload=True)
