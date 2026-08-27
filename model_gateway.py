@@ -5,6 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class ModelGateway:
     def __init__(self, config: Dict):
         self.backend = config.get('backend', 'mock')
@@ -37,7 +38,7 @@ class ModelGateway:
 
             def timeout_handler(signum, frame):
                 raise TimeoutError(f"Function {func.__name__} exceeded {timeout}s")
-            
+
             old_handler = signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(timeout)
             try:
@@ -92,13 +93,14 @@ class ModelGateway:
             try:
                 # Import necessary modules and set up the environment
                 from eth_account import Account
-                from flash_hunter import Rpc, load_key, BROADCAST_RPCS, HOT_WALLET, load_executor
+                from flash_hunter import load_key, BROADCAST_RPCS, HOT_WALLET, load_executor
                 import os
 
-                # Set up RPC for scanning and broadcasting (we can use the same for simplicity)
-                rpc_scan = Rpc(BROADCAST_RPCS[0])  # Using the first broadcast RPC for scanning
-                # For the hunter's main RPC, we can use the same or a different one. We'll use the same.
-                rpc = rpc_scan
+                # For scanning, hunt_once expects a URL string (it creates its own Vrpc internally)
+                rpc_scan_url = BROADCAST_RPCS[0]
+                # For the hunter's main RPC (signing/broadcasting), use flash_hunter.Rpc
+                from flash_hunter import Rpc as HunterRpc
+                rpc = HunterRpc(BROADCAST_RPCS[0])
 
                 # Load account
                 SECRET_FILE = os.path.join(os.path.dirname(__file__), ".hot_secret")
@@ -117,14 +119,14 @@ class ModelGateway:
                 if hunt_once_func is None:
                     return {"status": "error", "error": "primary_hunt tool not loaded"}
 
-                # Now call hunt_once_func
+                # Now call hunt_once_func with URL string for rpc_scan
                 result = self._run_with_timeout(
-                    hunt_once_func, 
-                    timeout, 
-                    rpc, 
-                    acct, 
-                    executor_addr, 
-                    rpc_scan, 
+                    hunt_once_func,
+                    timeout,
+                    rpc,
+                    acct,
+                    executor_addr,
+                    rpc_scan_url,
                     False  # verbose=False
                 )
 
@@ -145,17 +147,11 @@ class ModelGateway:
         # Stub for actual inference. Since we're delaying model specifics, this is a mock.
         # Once you plug in Ollama/LlamaCpp, this is where it goes.
         logger.info(f"Mock LLM invoke for {task_type} with payload {payload}")
-        
+
         # Simulate model thinking
         response = {
             "task_type": task_type,
             "analysis": "All systems nominal. No strategy adjustments required.",
             "action": "pass"
         }
-        
-        # If task_type is 'gas_watcher', simulate a dynamic adjustment recommendation
-        if task_type == "gas_watcher":
-            response["action"] = "adjust_gas_multiplier"
-            response["new_multiplier"] = 1.5
-            
         return {"status": "success", "data": response}
