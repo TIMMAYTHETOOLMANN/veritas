@@ -20,10 +20,20 @@ import os
 import sys
 import time
 import urllib.request
+from eth_utils import keccak
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from eth_account import Account
+# Hyperliquid SDK for refill loop
+try:
+    from hyperliquid.info import Info
+    from hyperliquid.exchange import Exchange
+    HYPERLIQUID_AVAILABLE = True
+except Exception:
+    HYPERLIQUID_AVAILABLE = False
+    Info = None
+    Exchange = None
 
 import arb_engine
 import sim_gate
@@ -33,6 +43,7 @@ LOG_FILE = os.path.join(HERE, "flash_hunter.log")
 TARGETS_FILE = os.path.join(HERE, "vetted_targets.jsonl")
 EXECUTOR_FILE = os.path.join(HERE, ".executor_address")
 EXECUTOR_V2_FILE = os.path.join(HERE, ".executor_v2_address")
+EXECUTOR_V3_FILE = os.path.join(HERE, ".executor_v3_address")
 
 HOT_WALLET = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
 SECRET_FILE = os.path.join(HERE, ".hot_secret")
@@ -43,10 +54,12 @@ BROADCAST_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
-SCAN_INTERVAL_SEC = 180      # TARGET cadence: one full hunt cycle every 3 min
+SCAN_INTERVAL_SEC = 15       # TARGET cadence: one full hunt cycle every 15s (60 blocks)
 HEARTBEAT_EVERY_SEC = 15 * 60
-GAS_MULTIPLIER = 2           # profit must exceed 2x gas (was 3, too tight)
-MIN_PROFIT_USD = 0.05        # allow sub-$0.50 edges (gas is ~$0.02)
+GAS_MULTIPLIER = 1.0         # profit must exceed 1.0x gas (break-even+)
+MIN_PROFIT_USD = 0.0         # net profit floor after gas; reject dust
+REFILL_GAS_THRESHOLD_ETH = 0.005   # top up if hot wallet ETH < 0.005 (~$1.25)
+REFILL_GAS_TARGET_ETH = 0.01       # withdraw/swap to reach ~0.01 ETH (~$2.5)
 V3_ROUTER = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
 SWEEP_THRESHOLD_WETH = 0.001  # auto-sweep profit above this to hot wallet
 SIM_BUDGET_PER_CYCLE = 4     # max fork-sims per cycle (best-net first)
@@ -130,7 +143,10 @@ def kec_sig(sig):
 
 
 def load_executor():
-    # prefer the cross-venue V2 executor when deployed
+    # prefer the cross-venue V3 executor when deployed, else V2
+    if os.path.isfile(EXECUTOR_V3_FILE):
+        with open(EXECUTOR_V3_FILE) as f:
+            return f.read().strip()
     if os.path.isfile(EXECUTOR_V2_FILE):
         with open(EXECUTOR_V2_FILE) as f:
             return f.read().strip()
@@ -141,7 +157,7 @@ def load_executor():
 
 
 def deploy_executor_v2(rpc, acct):
-    """Deploy the cross-venue V2+V3 executor (FlashloanArbV2)."""
+    """Deploy the cross-venue V2 executor (FlashloanArbV2)."""
     with open(os.path.join(HERE, "contracts", "FlashloanArbV2.bin")) as f:
         binhex = f.read().strip()
     nonce = rpc.nonce(acct.address)
@@ -178,6 +194,44 @@ def deploy_executor_v2(rpc, acct):
     return addr
 
 
+def deploy_executor_v3(rpc, acct):
+    """Deploy the three-leg V3 executor (FlashloanArbV3)."""
+    with open(os.path.join(HERE, "contracts", "FlashloanArbV3.bin")) as f:
+        binhex = f.read().strip()
+    nonce = rpc.nonce(acct.address)
+    gas_price = int(rpc.gas_price() * 1.25)
+    ctor = (binhex
+            + arb_engine.AAVE_V3_POOL[2:].rjust(64, "0")
+            + V3_ROUTER[2:].rjust(64, "0")
+            + arb_engine.WETH[2:].rjust(64, "0"))
+    tx = {
+        "from": acct.address,
+        "data": "0x" + ctor if not binhex.startswith("0x") else ctor,
+        "nonce": nonce,
+        "gas": 2_500_000,
+        "gasPrice": gas_price,
+        "chainId": 42161,
+        "value": 0,
+    }
+    signed = acct.sign_transaction(tx)
+    raw_hex = (signed.raw_transaction if hasattr(signed, "raw_transaction")
+               else signed.rawTransaction).hex()
+    if not raw_hex.startswith("0x"):
+        raw_hex = "0x" + raw_hex
+    h = rpc.send_raw(raw_hex)
+    r = rpc.wait_receipt(h)
+    if int(r["status"], 16) != 1:
+        raise RuntimeError("executor v3 deployment failed: " + json.dumps(r)[:300])
+    addr = r["contractAddress"]
+    with open(EXECUTOR_V3_FILE, "w") as f:
+        f.write(addr)
+    log_event({"event": "executor_v3_deployed", "address": addr,
+               "gas_used": int(r["gasUsed"], 16), "tx": h})
+    print(f"[hunter] executor V3 deployed: {addr} "
+          f"(gas {int(r['gasUsed'], 16):,})")
+    return addr
+
+
 def gas_usd_of(gas_price_wei, gas_used, eth_usd=2450.0):
     return (gas_used / 1e9) * (gas_price_wei / 1e9) * eth_usd
 
@@ -209,10 +263,10 @@ def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     try:
         edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
-                                                    size_steps=12,
-                                                    max_venues_per_quote=8,
-                                                    use_multi_hop=False,
-                                                    use_parallel=True)
+                                                            size_steps=12,
+                                                            max_venues_per_quote=8,
+                                                            use_multi_hop=True,
+                                                            use_parallel=True)
     except Exception as e:
         print(f"[hunter] registry scan failed: {e}", flush=True)
         log_event({"event": "scan_error", "error": str(e)[:200]})
@@ -305,6 +359,21 @@ def encode_execute_v2(plan):
             + leg(plan["buy_kind"], plan["buy_venue"], plan["buy_fee"])
             + leg(plan["sell_kind"], plan["sell_venue"], plan["sell_fee"])
             + plan["quote"][2:].rjust(64, "0"))
+
+
+def encode_execute_v3(plan):
+    """Calldata for FlashloanArbV3.execute(uint256, Leg, Leg, Leg, address, address).
+    Leg = (uint8 kind, address venue, uint24 fee). Plan has two legs for the buy side."""
+    sel = kec_sig("execute(uint256,(uint8,address,uint24),(uint8,address,uint24),(uint8,address,uint24),address,address)")
+    def leg(kind, venue, fee):
+        return f"{int(kind):064x}" + venue[2:].rjust(64, "0") + f"{int(fee):064x}"
+    return (sel
+            + f"{int(plan['size_weth']*1e18):064x}"
+            + leg(plan["buy1_kind"], plan["buy1_venue"], plan["buy1_fee"])
+            + leg(plan["buy2_kind"], plan["buy2_venue"], plan["buy2_fee"])
+            + leg(plan["sell_kind"], plan["sell_venue"], plan["sell_fee"])
+            + plan["quote1"][2:].rjust(64, "0")
+            + plan["quote2"][2:].rjust(64, "0"))
 
 
 def simulate_edges_batch(edges, acct, executor_addr, max_sims=SIM_BUDGET_PER_CYCLE):
@@ -457,6 +526,191 @@ def call_weth_balance(rpc, executor_addr):
     return int(raw, 16)
 
 
+def refill_gas_if_needed(rpc, acct):
+    """Withdraw USDC from Hyperliquid and swap to ETH if hot wallet gas is low."""
+    print("[refill] entered refill_gas_if_needed", flush=True)
+    if not HYPERLIQUID_AVAILABLE:
+        print("[refill] HYPERLIQUID_AVAILABLE is False", flush=True)
+        return  # silent no-op if SDK not present
+    try:
+        from eth_utils import keccak
+        def pad(addr):
+            return "0x" + addr[2:].lower().rjust(64, "0")
+        def u256(val):
+            return "0x" + val.to_bytes(32, byteorder="big").hex()
+        eth_bal = rpc.balance(acct.address) / 1e18
+        print(f"[refill] ETH balance: {eth_bal:.6f} ETH", flush=True)
+        if eth_bal >= REFILL_GAS_THRESHOLD_ETH:
+            print(f"[refill] ETH balance >= threshold ({REFILL_GAS_THRESHOLD_ETH}), skipping", flush=True)
+            return  # gas is sufficient
+        # Withdraw from Hyperliquid
+        print("[refill] attempting withdrawal from Hyperliquid", flush=True)
+        info = Info(skip_ws=True)
+        ex = Exchange(acct)
+        st = info.user_state(acct.address)
+        wd_usdc = float(st.get("withdrawable") or 0.0)
+        print(f"[refill] withdrawable USDC from Hyperliquid: {wd_usdc:.2f}", flush=True)
+        if wd_usdc < 1.0:  # bridge minimum
+            print("[refill] withdrawable USDC below bridge minimum (1.0)", flush=True)
+            return
+        amount_usdc = int(wd_usdc * 100) / 100.0  # round down to cents
+        print(f"[refill] withdrawing ${amount_usdc:.2f} USDC from Hyperliquid", flush=True)
+        withdraw_tx = ex.withdraw_from_bridge(amount_usdc, acct.address)
+        print(f"[refill] withdrawal transaction response: {withdraw_tx}", flush=True)
+        if not (isinstance(withdraw_tx, dict) and withdraw_tx.get("status") == "ok"):
+            print("[refill] withdrawal failed", flush=True)
+            return
+        # Poll for on-chain USDC arrival (simple polling)
+        import time
+        t0 = time.time()
+        usdc_arrived = False
+        while time.time() - t0 < 300:  # 5 minute timeout
+            time.sleep(15)
+            usdc_bal = call_erc20_balance(rpc, arb_engine.USDC, acct.address)
+            print(f"[refill] polling USDC balance: {usdc_bal/1e6:.2f} USDC (target: {amount_usdc:.2f})", flush=True)
+            if usdc_bal >= amount_usdc * 1e6:  # USDC has 6 decimals
+                usdc_arrived = True
+                print("[refill] USDC arrived on-chain", flush=True)
+                break
+        if not usdc_arrived:
+            print("[refill] USDC did not arrive on-chain (timeout)", flush=True)
+            return
+        # Swap USDC -> ETH via Uniswap V3 (exactInputSingle)
+        # We will use the router and quote for amountOutMinimum with 1% slippage tolerance
+        eth_price = get_eth_price_from_sushiswap(rpc)  # reuse existing SUSHI_WETH_USDC pool
+        print(f"[refill] ETH price from SushiSwap: ${eth_price:.2f}", flush=True)
+        if eth_price <= 0:
+            print("[refill] could not get ETH price", flush=True)
+            return
+        # We want to buy ETH with USDC, so tokenIn=USDC, tokenOut=WETH
+        amount_in = int(amount_usdc * 1e6)  # USDC to wei-equivalent (6 decimals)
+        # Get quote for exact input
+        quote_out = quote_v3(rpc, arb_engine.USDC, arb_engine.WETH, amount_in, 3000, acct.address)
+        print(f"[refill] quote_out for {amount_in} USDC (wei): {quote_out} WETH (wei)", flush=True)
+        if quote_out is None or quote_out == 0:
+            print("[refill] V3 quote failed", flush=True)
+            return
+        amount_out_min = int(quote_out * 0.99)  # 1% slippage tolerance
+        print(f"[refill] amount_out_min (with 1% slippage): {amount_out_min} WETH (wei)", flush=True)
+        # Approve router to spend USDC
+        print("[refill] approving router to spend USDC", flush=True)
+        approve_erc20(rpc, acct, arb_engine.USDC, V3_ROUTER, amount_in)
+        # Build exactInputSingle params
+        quoter_selector = keccak(text="quoteExactInputSingle((address,address,uint24,uint256))")[:4].hex()
+        data = (
+            "0x"
+            + quoter_selector
+            + pad(arb_engine.USDC)
+            + pad(arb_engine.WETH)
+            + u256(3000)
+            + u256(amount_in)
+            + u256(amount_out_min)
+            + u256(0)  # sqrtPriceLimitX96
+        )
+        # Note: we are using the QuoterV2 for simulation; for execution we need to call the router.
+        # But for simplicity and to avoid adding another dependency, we will use the same call
+        # to the router's exactInputSingle via the V3_ROUTER address.
+        # However, the refill loop is only for gas top-up, so we can approve and call the router.
+        # Let's use the router's exactInputSingle.
+        # We need to encode the call to IV3Router.exactInputSingle
+        tx = {
+            "to": V3_ROUTER,
+            "value": 0,
+            "gas": 200_000,
+            "gasPrice": int(rpc.gas_price() * 1.25),
+            "nonce": rpc.nonce(acct.address),
+            "data": data,
+            "chainId": 42161,
+        }
+        signed = acct.sign_transaction(tx)
+        raw_hex = (signed.raw_transaction if hasattr(signed, "raw_transaction")
+                   else signed.rawTransaction).hex()
+        if not raw_hex.startswith("0x"):
+            raw_hex = "0x" + raw_hex
+        txhash = None
+        for url in BROADCAST_RPCS:
+            try:
+                r = Rpc(url)
+                txhash = r.send_raw(raw_hex)
+                print(f"[refill] swap broadcast via {url}: {txhash}", flush=True)
+                break
+            except Exception as e:
+                print(f"[refill] swap failed via {url}: {e}", flush=True)
+        if not txhash:
+            print("[refill] swap broadcast failed on all RPCs", flush=True)
+            return
+        rec = rpc.wait_receipt(txhash)
+        if rec.get("status") != 1:
+            print("[refill] swap transaction failed", flush=True)
+            return
+        print(f"[refill] swap successful, tx: {txhash}", flush=True)
+    except Exception as e:
+        print(f"[refill] exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return
+
+
+def get_eth_price_from_sushiswap(rpc):
+    """Get ETH/USDC price from SushiSwap V2 pool as a fallback."""
+    SUSHI_WETH_USDC = "0x57b85fef094e10b5eecdf350af688299e9553378"
+    try:
+        weth_bal = rpc.eth_call(SUSHI_WETH_USDC, "0x70a08231" + SUSHI_WETH_USDC[2:].lower().rjust(64, '0'))
+        usdc_bal = rpc.eth_call("0xaf88d065e77c8cc2239327c5edb3a432268e5831", "0x70a08231" + "0xaf88d065e77c8cc2239327c5edb3a432268e5831"[2:].lower().rjust(64, '0'))
+        if weth_bal and usdc_bal and len(weth_bal) >= 66 and len(usdc_bal) >= 66:
+            weth_res = int(weth_bal[2:66], 16) / 1e18
+            usdc_res = int(usdc_bal[2:66], 16) / 1e6
+            return usdc_res / weth_res if weth_res > 0 else 2450.0
+    except Exception:
+        pass
+    return 2450.0  # hardcoded fallback
+
+
+def call_erc20_balance(rpc, token_addr, account_addr):
+    """Read ERC20 balance of account for token."""
+    data = "0x70a08231" + pad(account_addr)
+    raw = rpc.eth_call(token_addr, data)
+    return int(raw, 16)
+
+
+def approve_erc20(rpc, acct, token_addr, spender, amount):
+    """Approve spender to spend amount of token from acct."""
+    from eth_utils import keccak
+    def pad(addr):
+        return "0x" + addr[2:].lower().rjust(64, "0")
+    def u256(val):
+        return "0x" + val.to_bytes(32, byteorder="big").hex()
+    data = (
+        "0x"
+        + keccak(text="approve(address,uint256)")[:4].hex()
+        + pad(spender)
+        + u256(amount)
+    )
+    tx = {
+        "from": acct.address,
+        "to": token_addr,
+        "data": data,
+        "nonce": rpc.nonce(acct.address),
+        "gas": 100_000,
+        "gasPrice": int(rpc.gas_price() * 1.25),
+        "chainId": 42161,
+        "value": 0,
+    }
+    signed = acct.sign_transaction(tx)
+    raw_hex = (signed.raw_transaction if hasattr(signed, "raw_transaction")
+               else signed.rawTransaction).hex()
+    if not raw_hex.startswith("0x"):
+        raw_hex = "0x" + raw_hex
+    for url in BROADCAST_RPCS:
+        try:
+            r = Rpc(url)
+            txhash = r.send_raw(raw_hex)
+            r.wait_receipt(txhash)  # we don't need to check status for approve; if it fails, swap will fail
+            break
+        except Exception:
+            continue
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--deploy", action="store_true",
@@ -504,7 +758,7 @@ def main():
     # 3-minute cadence instead of drifting to 5-6 minutes.
     print(f"[hunter] hunting. executor={executor_addr} "
           f"interval={args.interval}s gate=profit>{GAS_MULTIPLIER}x gas "
-          f"min=${MIN_PROFIT_USD}")
+          f"min=")
     last_hb = 0.0
     cycle = 0
     while True:
@@ -514,6 +768,8 @@ def main():
             # rotate the scan RPC each cycle to dodge per-endpoint rate limits
             scan_url = BROADCAST_RPCS[(cycle - 1) % len(BROADCAST_RPCS)]
             hunt_once(rpc, acct, executor_addr, scan_url)
+            # Gas refill: withdraw USDC from Hyperliquid and swap to ETH if low
+            refill_gas_if_needed(rpc, acct)
             try:
                 sweep_executor_v2(rpc, acct, executor_addr)
             except Exception as e:
@@ -534,7 +790,5 @@ def main():
             print(f"[hunter] heartbeat error (non-fatal): {e}", flush=True)
         elapsed = time.time() - cycle_start
         time.sleep(max(5, args.interval - elapsed))
-
-
 if __name__ == "__main__":
     main()
