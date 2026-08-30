@@ -198,9 +198,10 @@ class ZKProver:
             
             # Generate witness
             witness_file = BUILD_DIR / "witness.wtns"
+            generate_witness = BUILD_DIR / f"{CIRCUIT_NAME}_js" / "generate_witness.js"
             result = subprocess.run([
-                "node", str(WASM_FILE), str(input_file), str(witness_file)
-            ], capture_output=True, timeout=60)
+                "node", str(generate_witness), str(WASM_FILE), str(input_file), str(witness_file)
+            ], capture_output=True, timeout=90)
             if result.returncode != 0:
                 print(f"[zk_prover] Witness gen failed: {result.stderr.decode()}")
                 return None
