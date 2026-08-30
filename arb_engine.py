@@ -241,18 +241,19 @@ V2_CACHE_TTL = 4.0           # seconds
 def _v2_pool_state(rpc, pool_addr):
     """(token0, r0_raw, r1_raw) with a short TTL cache."""
     now = time.time()
+    now = time.time()
     hit = _v2_pool_cache.get(pool_addr)
     if hit and now - hit[3] < V2_CACHE_TTL:
-        return hit[0], hit[1], hit[2]
+        return hit[0], hit[1], hit[2], hit[3]
     t0 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token0"]))
+    t1 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token1"]))
     r0_raw, r1_raw = parse_reserves(rpc.eth_call(pool_addr, "0x" + SEL["reserves"]))
     if t0 is None or r0_raw is None:
-        return None, None, None
-    _v2_pool_cache[pool_addr] = (t0, r0_raw, r1_raw, now)
+        return None, None, None, None
+    _v2_pool_cache[pool_addr] = (t0, t1, r0_raw, r1_raw, now)
     if len(_v2_pool_cache) > 2000:   # bound memory
         _v2_pool_cache.clear()
-    return t0, r0_raw, r1_raw
-
+    return t0, t1, r0_raw, r1_raw
 def v2_quote_out(rpc, pool_addr, token_in, token_out, amount_in_raw, q_dec=None):
     """Exact V2 out by pool ADDRESS using live reserves. RAW integer units in/out.
 
@@ -260,7 +261,7 @@ def v2_quote_out(rpc, pool_addr, token_in, token_out, amount_in_raw, q_dec=None)
     amount must be scaled by the OUTPUT token's decimals, never the quote
     token's (the #1 silent edge-detection killer)."""
     try:
-        t0, r0_raw, r1_raw = _v2_pool_state(rpc, pool_addr)
+        t0, t1, r0_raw, r1_raw = _v2_pool_state(rpc, pool_addr)
         if t0 is None or r0_raw is None:
             return None
         dec_in = token_decimals(rpc, token_in)
@@ -577,7 +578,7 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
         key = venue[2]
         if key in _v3_mid_cache:
             return _v3_mid_cache[key]
-        t0, r0_raw, r1_raw = _v2_pool_state(rpc, key)
+        t0, t1, r0_raw, r1_raw = _v2_pool_state(rpc,  key)
         mid = None
         if t0 and r0_raw and r1_raw:
             # WETH may be token0 or token1 — the quote side is the other one
@@ -679,7 +680,7 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
                     # with market depth: V2 caps at min(2.0, 5% of pool
                     # WETH reserve); V3 caps at 2.0 WETH (deep pools absorb).
                     if b_buy[1] == 0:  # V2
-                        t0, r0_raw, r1_raw = _v2_pool_state(rpc, b_buy[2])
+                        t0, t1, r0_raw, r1_raw = _v2_pool_state(rpc,  b_buy[2])
                         weth_res = (r0_raw if t0 == WETH else r1_raw) / 1e18
                         hi = min(2.0, weth_res * 0.05) if weth_res > 0 else 0.5
                     else:  # V3
