@@ -1,7 +1,9 @@
-template Test() {
-    signal input a;
-    signal output b;
-    b <== a * a;
+pragma circom 0.5.46;
+
+template Multiplier2() {
+   signal input in;
+   signal output out;
+   out <== in * in;
 }
 
-component main = Test();
+component main = Multiplier2();
