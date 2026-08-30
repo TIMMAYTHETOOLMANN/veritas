@@ -1,4 +1,4 @@
-pragma circom 0.5.46;
+pragma circom 2.0.0;
 
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/comparators.circom";
@@ -27,22 +27,22 @@ template ArbProofVerifier() {
     signal input state_root;        // Verkle root of pool registry (block hash)
     
     // === PRIVATE INPUTS (known only to prover/hunter) ===
-    signal private input pool_a_addr;
-    signal private input pool_b_addr;
-    signal private input reserve_a0;
-    signal private input reserve_a1;
-    signal private input reserve_b0;
-    signal private input reserve_b1;
-    signal private input amount_in;       // WETH borrowed (1e18)
-    signal private input fee_a;           // Pool A fee in basis points * 100 (3000 = 0.3%)
-    signal private input fee_b;           // Pool B fee in basis points * 100
+    signal input pool_a_addr;
+    signal input pool_b_addr;
+    signal input reserve_a0;
+    signal input reserve_a1;
+    signal input reserve_b0;
+    signal input reserve_b1;
+    signal input amount_in;       // WETH borrowed (1e18)
+    signal input fee_a;           // Pool A fee in basis points * 100 (3000 = 0.3%)
+    signal input fee_b;           // Pool B fee in basis points * 100
     
     // Verkle witnesses (32 elements each = KZG commitments for k=1024, d=5)
-    signal private input verkle_witness_a[32];
-    signal private input verkle_witness_b[32];
+    signal input verkle_witness_a[32];
+    signal input verkle_witness_b[32];
     // Verkle authentication paths (5 levels each for depth=5)
-    signal private input verkle_path_a[5];
-    signal private input verkle_path_b[5];
+    signal input verkle_path_a[5];
+    signal input verkle_path_b[5];
     
     // === CIRCUIT LOGIC ===
     
@@ -57,8 +57,7 @@ template ArbProofVerifier() {
     signal denom_a;
     denom_a <== reserve_a0 + amount_in_net;
     signal quote_out;
-    quote_out <== reserve_a1 * amount_in_net;
-    quote_out <== quote_out / denom_a;  // Division constraint
+    quote_out <== reserve_a1 * amount_in_net / denom_a;  // Division constraint
     
     // --- CPMM Leg 2: Pool B (quote -> WETH) ---
     signal fee_mult_b;
@@ -69,8 +68,7 @@ template ArbProofVerifier() {
     signal denom_b;
     denom_b <== reserve_b1 + quote_out_net;
     signal weth_back;
-    weth_back <== reserve_b0 * quote_out_net;
-    weth_back <== weth_back / denom_b;
+    weth_back <== reserve_b0 * quote_out_net / denom_b;
     
     // --- Profit Calculation ---
     signal profit_weth;
