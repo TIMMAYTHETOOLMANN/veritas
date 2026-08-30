@@ -239,11 +239,10 @@ _v2_pool_cache = {}          # pool_addr -> (token0, r0_raw, r1_raw, ts)
 V2_CACHE_TTL = 4.0           # seconds
 
 def _v2_pool_state(rpc, pool_addr):
-    """(token0, r0_raw, r1_raw) with a short TTL cache."""
-    now = time.time()
+    """(token0, t1, r0_raw, r1_raw) with a short TTL cache."""
     now = time.time()
     hit = _v2_pool_cache.get(pool_addr)
-    if hit and now - hit[3] < V2_CACHE_TTL:
+    if hit and now - hit[4] < V2_CACHE_TTL:
         return hit[0], hit[1], hit[2], hit[3]
     t0 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token0"]))
     t1 = parse_addr(rpc.eth_call(pool_addr, "0x" + SEL["token1"]))
