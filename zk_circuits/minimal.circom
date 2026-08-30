@@ -1,8 +1,8 @@
 pragma circom 2.0.0;
 
-template Test() {
+template Minimal() {
    signal input in;
    signal output out;
    out <== in;
 }
-component main = Test();
+component main = Minimal();

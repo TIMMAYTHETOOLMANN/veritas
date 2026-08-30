@@ -7,6 +7,7 @@ Run once: python3 build_zk.py
 import json
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -29,14 +30,27 @@ def run(cmd, cwd=None, desc=""):
 
 def main():
     print("[build] === VERITAS ZK Artifact Builder ===")
-    
+
     # 1. Check dependencies
+    import shutil
     for tool in ["circom", "snarkjs", "node"]:
-        if subprocess.run(["which", tool], capture_output=True).returncode != 0:
+        if shutil.which(tool) is None:
             print(f"[build] ERROR: {tool} not found in PATH")
-            print("  Install: npm install -g circom snarkjs")
+            if tool == "circom" or tool == "snarkjs":
+                print("  Install: npm install -g circom snarkjs")
+            elif tool == "node":
+                print("  Install: https://nodejs.org/")
             sys.exit(1)
-    
+
+    # Get absolute paths for the tools
+    circom_path = shutil.which("circom")
+    snarkjs_path = shutil.which("snarkjs")
+    node_path = shutil.which("node")
+
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    PTAU_DIR.mkdir(parents=True, exist_ok=True)
+    CONTRACTS_DIR.mkdir(parents=True, exist_ok=True)
+
     # 2. Find circomlib
     circomlib = None
     for base in [Path.home() / "node_modules", Path("/usr/local/lib/node_modules"), 
@@ -45,27 +59,27 @@ def main():
         if p.exists():
             circomlib = str(base / "circomlib")
             break
-    
+
     if not circomlib:
         print("[build] circomlib not found. Install with: npm install -g circomlib")
         print("[build] Or install locally: npm install circomlib")
         sys.exit(1)
-    
+
     print(f"[build] Using circomlib: {circomlib}")
-    
+
     # 3. Create directories
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     PTAU_DIR.mkdir(parents=True, exist_ok=True)
     CONTRACTS_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # 4. Compile circuit
     print("[build] Compiling circuit...")
     run([
-        "circom", str(CIRCUITS_DIR / f"{CIRCUIT_NAME}.circom"),
+        circom_path, str(CIRCUITS_DIR / f"{CIRCUIT_NAME}.circom"),
         "--r1cs", "--wasm", "--sym", "-o", str(BUILD_DIR),
         "-l", circomlib
     ], desc="circom compile")
-    
+
     # 5. Powers of Tau (BN254 universal ptau)
     ptau = PTAU_DIR / "pot14_final.ptau"
     if not ptau.exists():
@@ -74,29 +88,37 @@ def main():
             "wget", "-O", str(ptau),
             "https://storage.googleapis.com/zkevm/ptau/powersOfTau28_hez_final_14.ptau"
         ], desc="download ptau")
-    
+
     # 6. Groth16 setup
     print("[build] Groth16 setup...")
-    run(["snarkjs", "groth16", "setup",
+    run([
+        snarkjs_path, "groth16", "setup",
         str(BUILD_DIR / f"{CIRCUIT_NAME}.r1cs"), str(ptau),
-        str(BUILD_DIR / f"{CIRCUIT_NAME}_0000.zkey")], desc="groth16 setup")
-    
+        str(BUILD_DIR / f"{CIRCUIT_NAME}_0000.zkey")
+    ], desc="groth16 setup")
+
     print("[build] Contributing to proving key...")
-    run(["snarkjs", "zkey", "contribute",
+    run([
+        snarkjs_path, "zkey", "contribute",
         str(BUILD_DIR / f"{CIRCUIT_NAME}_0000.zkey"),
-        str(BUILD_DIR / f"{CIRCUIT_NAME}_0001.zkey"), "--name", "VERITAS", "-v"],
-        desc="zkey contribute")
-    
+        str(BUILD_DIR / f"{CIRCUIT_NAME}_0001.zkey"),
+        "--name", "VERITAS", "-v"
+    ], desc="zkey contribute")
+
     print("[build] Exporting verification key...")
-    run(["snarkjs", "zkey", "export", "verificationkey",
+    run([
+        snarkjs_path, "zkey", "export", "verificationkey",
         str(BUILD_DIR / f"{CIRCUIT_NAME}_0001.zkey"),
-        str(BUILD_DIR / f"{CIRCUIT_NAME}_vkey.json")], desc="export vkey")
-    
+        str(BUILD_DIR / f"{CIRCUIT_NAME}_vkey.json")
+    ], desc="export vkey")
+
     print("[build] Exporting Solidity verifier...")
-    run(["snarkjs", "zkey", "export", "solidityverifier",
+    run([
+        snarkjs_path, "zkey", "export", "solidityverifier",
         str(BUILD_DIR / f"{CIRCUIT_NAME}_0001.zkey"),
-        str(CONTRACTS_DIR / "Groth16Verifier.sol")], desc="export solidity verifier")
-    
+        str(CONTRACTS_DIR / "Groth16Verifier.sol")
+    ], desc="export solidity verifier")
+
     # 7. Verify artifacts
     artifacts = [
         BUILD_DIR / f"{CIRCUIT_NAME}.r1cs",
@@ -105,7 +127,7 @@ def main():
         BUILD_DIR / f"{CIRCUIT_NAME}_vkey.json",
         CONTRACTS_DIR / "Groth16Verifier.sol",
     ]
-    
+
     print("[build] Verifying artifacts...")
     for a in artifacts:
         if a.exists():
@@ -113,7 +135,7 @@ def main():
         else:
             print(f"  ✗ MISSING: {a}")
             sys.exit(1)
-    
+
     print("[build] === BUILD COMPLETE ===")
     print(f"  Proving key: {BUILD_DIR / f'{CIRCUIT_NAME}_0001.zkey'}")
     print(f"  Verification key: {BUILD_DIR / f'{CIRCUIT_NAME}_vkey.json'}")
