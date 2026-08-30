@@ -63,7 +63,7 @@ def main():
 
     os.makedirs(os.path.dirname(wasm_path), exist_ok=True)
 
-    circom_cmd = f'circom "{circuit_path}" -r "{r1cs_path}" -w "{wasm_path}" -s "{sym_path}" -l "{circomlib_path}"'
+    circom_cmd = f'circom "{circuit_path}" --r1cs --wasm --sym -o "{build_dir}" -l "{circomlib_path}"'
     result = run(circom_cmd)
     if result.returncode != 0:
         print("[build] ERROR: Circom compilation failed.")
