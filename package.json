@@ -1,5 +1,8 @@
 {
   "dependencies": {
     "circomlib": "^2.0.5"
+  },
+  "devDependencies": {
+    "circom": "^0.5.46"
   }
 }
