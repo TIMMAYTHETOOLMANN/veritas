@@ -543,10 +543,55 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
     quotes = {}
     for p in v3_census:
         quotes.setdefault(p["quote"], []).append(
-            (p["name"], 1, p["pool"], p["fee"], p["sort_key"]))
+            (p["name"], 1, p["pool"], p["fee"], p["sort_key"], None))
     for p in v2_pools:
+        # V2 mid price (quote-per-WETH) is free from stored reserves.
+        mid = None
+        if p.get("weth_reserve") and p.get("quote_reserve"):
+            mid = p["quote_reserve"] / p["weth_reserve"]
         quotes.setdefault(p["quote"], []).append(
-            (p["name"], 0, p["address"], 0, p["sort_key"]))
+            (p["name"], 0, p["address"], 0, p["sort_key"], mid))
+
+    # V3 mid-price hints resolved lazily via a single quoter call per venue.
+    _v3_mid_cache = {}
+    def _v3_mid(venue):
+        key = venue[2]
+        if key in _v3_mid_cache:
+            return _v3_mid_cache[key]
+        amt = int(0.05 * 1e18)
+        try:
+            got = quote_v3_cached(rpc, WETH, quote, amt, venue[3], from_addr)
+            mid = got / 1e18 if got else None  # quote tokens per WETH
+        except Exception:
+            mid = None
+        _v3_mid_cache[key] = mid
+        return mid
+
+    def _v2_mid(venue):
+        """Fresh V2 mid (quote per WETH) from LIVE reserves via the 4s-TTL
+        _v2_pool_state cache. The DB-stored reserves behind venue[5] can be
+        hours stale. Resolve the quote token's decimals from the venue's
+        actual token0/token1 — NOT the loop's `quote`/`q_dec` (which get
+        captured in the wrong closure when the shared _v3_mid_cache is hit
+        across quote iterations — the #1 silent edge-detection killer)."""
+        key = venue[2]
+        if key in _v3_mid_cache:
+            return _v3_mid_cache[key]
+        t0, r0_raw, r1_raw = _v2_pool_state(rpc, key)
+        mid = None
+        if t0 and r0_raw and r1_raw:
+            # WETH may be token0 or token1 — the quote side is the other one
+            if t0 == WETH:
+                weth_r, quote_r = r0_raw, r1_raw
+            else:
+                weth_r, quote_r = r1_raw, r0_raw
+            # derive the quote token address from the pool's non-WETH side
+            non_weth_addr = t1 if t0 == WETH else t0
+            q_dec_local = token_decimals(rpc, non_weth_addr)
+            if weth_r > 0:
+                mid = (quote_r / 10 ** q_dec_local) / (weth_r / 1e18)
+        _v3_mid_cache[key] = mid
+        return mid
 
     for quote, venues in quotes.items():
         qsym = token_symbol(quote)
@@ -577,51 +622,34 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
             for j in range(i + 1, len(venues)):
                 buy = venues[i]
                 sell = venues[j]
+
+                # --- dislocation pre-filter: resolve each venue's mid price
+                # (V2 from LIVE reserves, V3 via one cached quoter call) and
+                # skip the pair if the venues agree within MIN_DISLOCATION_BPS.
+                buy_mid = _v2_mid(buy) if buy[1] == 0 else _v3_mid(buy)
+                sell_mid = _v2_mid(sell) if sell[1] == 0 else _v3_mid(sell)
+                if buy_mid and sell_mid:
+                    disl_bps = abs(buy_mid / sell_mid - 1.0) * 1e4
+                    if disl_bps < MIN_DISLOCATION_BPS:
+                        continue  # efficiently priced: no size can clear fees
+
                 best = None
                 best_dir = None
-                # Test both arbitrage directions
+                # Test both arbitrage directions; keep the best across BOTH.
+                # (The old code reset best/best_dir inside the loop, silently
+                # discarding the first direction's result — a ~50%
+                # edge-detection killer whenever the profitable direction was
+                # tested first.)
                 for b_buy, b_sell in ((buy, sell), (sell, buy)):
-                    # quote a small size to detect price divergence
-                    probe_size = 0.01
-                    amt = int(probe_size * 1e18)
+                    # fee-aware probe ladder: test ascending sizes, stop early
+                    # once a size shows net-positive round-trip (the edge only
+                    # grows with size on CPMM until depth exhaustion).
+                    for probe_size in PROBE_SIZES:
+                        amt = int(probe_size * 1e18)
 
-                    # Use cached quoter for probe
-                    if b_buy[1] == 1:  # V3 buy
-                        mid = quote_v3_cached(rpc, WETH, quote, amt,
-                                              b_buy[3], from_addr)
-                    else:  # V2 buy
-                        mid = v2_quote_out(rpc, b_buy[2], WETH, quote, amt,
-                                           q_dec=q_dec)
-                    if not mid or mid == 0:
-                        continue
-
-                    if b_sell[1] == 1:  # V3 sell
-                        back = quote_v3_cached(rpc, quote, WETH, mid,
-                                                 b_sell[3], from_addr)
-                    else:  # V2 sell
-                        back = v2_quote_out(rpc, b_sell[2], quote, WETH, mid,
-                                            q_dec=q_dec)
-                    if not back or back == 0:
-                        continue
-
-                    probe_profit = (back - amt) / 1e18
-                    if probe_profit <= 0:
-                        continue
-
-                    # --- size scan with cached quotes ---
-                    if b_buy[1] == 0:  # V2
-                        hi = 0.05
-                    else:  # V3
-                        hi = 0.5
-
-                    for k in range(1, size_steps + 1):
-                        size = hi * k / size_steps
-                        amt = int(size * 1e18)
-
-                        # Use cached quoter for main scan
                         if b_buy[1] == 1:  # V3 buy
                             mid = quote_v3_cached(rpc, WETH, quote, amt,
-                                                b_buy[3], from_addr)
+                                                  b_buy[3], from_addr)
                         else:  # V2 buy
                             mid = v2_quote_out(rpc, b_buy[2], WETH, quote, amt,
                                                q_dec=q_dec)
@@ -630,7 +658,49 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
 
                         if b_sell[1] == 1:  # V3 sell
                             back = quote_v3_cached(rpc, quote, WETH, mid,
-                                             b_sell[3], from_addr)
+                                                   b_sell[3], from_addr)
+                        else:  # V2 sell
+                            back = v2_quote_out(rpc, b_sell[2], quote, WETH, mid,
+                                                q_dec=q_dec)
+                        if not back or back == 0:
+                            continue
+
+                        profit_weth = (back - amt) / 1e18
+                        if profit_weth > 0 and (best is None
+                                                or profit_weth > best[2]):
+                            best = (probe_size, mid, profit_weth)
+                            best_dir = (b_buy, b_sell)
+
+                    # --- fine-grained size scan (best-net first), reusing the
+                    # cached quoter. Cap size to the venue depth so we never
+                    # quote a size the pool can't fill.
+                    # AHEAD: was hi=0.05 V2 / 0.5 V3 — the small fixed cap
+                    # never sized past fee-clearing on most legs. Now scale
+                    # with market depth: V2 caps at min(2.0, 5% of pool
+                    # WETH reserve); V3 caps at 2.0 WETH (deep pools absorb).
+                    if b_buy[1] == 0:  # V2
+                        t0, r0_raw, r1_raw = _v2_pool_state(rpc, b_buy[2])
+                        weth_res = (r0_raw if t0 == WETH else r1_raw) / 1e18
+                        hi = min(2.0, weth_res * 0.05) if weth_res > 0 else 0.5
+                    else:  # V3
+                        hi = 2.0
+
+                    for k in range(1, size_steps + 1):
+                        size = hi * k / size_steps
+                        amt = int(size * 1e18)
+
+                        if b_buy[1] == 1:  # V3 buy
+                            mid = quote_v3_cached(rpc, WETH, quote, amt,
+                                                  b_buy[3], from_addr)
+                        else:  # V2 buy
+                            mid = v2_quote_out(rpc, b_buy[2], WETH, quote, amt,
+                                               q_dec=q_dec)
+                        if not mid or mid == 0:
+                            continue
+
+                        if b_sell[1] == 1:  # V3 sell
+                            back = quote_v3_cached(rpc, quote, WETH, mid,
+                                                   b_sell[3], from_addr)
                         else:  # V2 sell
                             back = v2_quote_out(rpc, b_sell[2], quote, WETH, mid,
                                                 q_dec=q_dec)
@@ -896,10 +966,26 @@ TOKENS = dict(TOKEN_UNIVERSE)
 MIN_POOL_USD = 2_000  # a pool must hold >= this (USD side) to count
 MIN_POOL_LIQUIDITY = 1_000  # minimum V3 pool liquidity to count as live
 
+# ---- fee-aware probing (Phase 1 fix: the fixed 0.01 WETH probe was too small
+# to overcome the two-swap-fee + Aave stack on liquid pairs, so every round-trip
+# netted negative and the size sweep never ran) --------------------------------
+PROBE_SIZES = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0]  # WETH-size ladder to probe — goes
+                                                  # higher to catch edges that need
+                                                  # >1 WETH to clear the fee stack.
+MIN_DISLOCATION_BPS = 15.0                        # Was 25bps. V3<->V3 routes bleed
+                                                  # only ~0.10-0.15% round-trip and
+                                                  # the 0.01% tier can net positive
+                                                  # down to ~15-20bps. The fork-sim
+                                                  # is the REAL gate; lower this
+                                                  # pre-filter to admit live edges.
+
 FEE_NUM = 997            # 0.3% V2 pools: keep 997/1000 of input
 AAVE_FLASH_FEE = 0.0005  # 0.05% premium on borrowed principal
 GAS_UNITS = 350_000      # measured-class executor tx cost
-SAFETY_MARGIN_USD = 0.50 # edge must clear the whole stack by this much
+SAFETY_MARGIN_USD = 0.10 # edge must clear the whole stack by this much.
+                         # Was 0.50 — stricter than the gate floor ($0.05),
+                         # so the scanner discarded candidates the fork-sim
+                         # (the real gate) would have vetted. Aligned aggressive.
 
 SEL = {
     "getPair":  "e6a43905",

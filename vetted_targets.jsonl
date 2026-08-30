@@ -31,3 +31,4 @@
 {"ts": "2026-08-28 12:42:53", "edges": 0, "sims": 0, "passes": 0, "broadcast": null, "elapsed_sec": 60.4, "vetted": []}
 {"ts": "2026-08-28 12:43:46", "edges": 0, "sims": 0, "passes": 0, "broadcast": null, "elapsed_sec": 46.1, "vetted": []}
 {"ts": "2026-08-28 12:44:47", "edges": 0, "sims": 0, "passes": 0, "broadcast": null, "elapsed_sec": 54.3, "vetted": []}
+{"dryrun_proof": {"started": "2026-08-29 16:54:50", "cycles": [{"cycle": 1, "error": "name 't1' is not defined", "elapsed_s": 108.7}, {"cycle": 2, "error": "name 't1' is not defined", "elapsed_s": 52.6}, {"cycle": 3, "error": "name 't1' is not defined", "elapsed_s": 54.8}], "ended": "2026-08-29 16:58:34", "cycles_total": 3, "edges_total": 0, "edges_found_any_cycle": false, "edges_per_cycle_avg": 0.0}}

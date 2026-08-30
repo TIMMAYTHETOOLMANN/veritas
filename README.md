@@ -27,9 +27,9 @@ archive/logs/          Historical census/sentinel logs
 
 ## Operations
 
-- Run engine:    `python3 flash_hunter.py --run` (target 180s cadence;
+- Run engine:    `python3 flash_hunter.py --run` (target 15s cadence;
                  sleep covers only the remainder after each cycle's work)
-- Tune cadence:  `python3 flash_hunter.py --run --interval 150`
+- Tune cadence:  `python3 flash_hunter.py --run --interval 30`
 - Heartbeat:     `python3 heartbeat_monitor.py`
 - Pool census:   `python3 pool_registry.py` (auto-resumes from DB)
 - Watchdogs (cron): ec2016bb9a90 (engine restart, */30) +
@@ -37,16 +37,19 @@ archive/logs/          Historical census/sentinel logs
 
 ## Hunt pipeline (2026-08-27 throughput overhaul)
 
-Every cycle (~3 min): scan → cross-RPC confirmation → batch fork-sim →
-broadcast best PASS. Every cycle writes a vetted result to
-`vetted_targets.jsonl` (top candidates, sim verdicts, broadcast status).
+Every cycle (15s target; actual cycle length is scan-bound): scan →
+cross-RPC confirmation → batch fork-sim → broadcast best PASS. Every
+cycle writes a vetted result to `vetted_targets.jsonl` (top candidates,
+sim verdicts, broadcast status).
 
 - Scan: V2 pool-state cache (4s TTL) + 5s quoter cache → ~10x fewer RPC calls
 - Confirmation: edges re-verified on 3 RPCs in parallel (2-of-3 vote);
   the old serial pass had a NameError that silently dropped EVERY edge
 - Vet: ONE anvil fork per cycle, evm_snapshot/evm_revert between sims,
-  up to 4 edges per cycle, best-net first
-- Cadence: elapsed-based sleep keeps the loop on the 180s target
+  up to 6 edges per cycle, best-net first
+- Gate: profit > 1.0x gas AND > $0.05 net (aligned across flash_hunter
+  + sim_gate; scanner SAFETY_MARGIN_USD = $0.10, dislocation filter 25bps)
+- Cadence: elapsed-based sleep keeps the loop on the 15s target
 - Scan RPC rotates each cycle to dodge per-endpoint rate limits
 - 3-pool multi-hop removed: zero-reserve dead code; the 2-leg executor
   cannot execute 3-pool routes anyway

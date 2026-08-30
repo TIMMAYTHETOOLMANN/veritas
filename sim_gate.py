@@ -50,8 +50,8 @@ FORK_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
-GAS_MULTIPLIER = 1.2     # aligned with flash_hunter.py — was 20, always rejected
-MIN_PROFIT_USD = 0.25    # aligned with flash_hunter.py — net profit floor
+GAS_MULTIPLIER = 1.0     # aligned with flash_hunter.py — break-even+ edges pass
+MIN_PROFIT_USD = 0.05    # aligned with flash_hunter.py — catch small edges, filter dust
 
 
 # ---- anvil lifecycle (proven sim_trade.py pattern) -----------------------

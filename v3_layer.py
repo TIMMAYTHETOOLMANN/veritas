@@ -169,11 +169,11 @@ def quote_v3_venue(rpc, token_in, token_out, amount_in, fee, from_addr, venue):
             "quoter": QUOTER_V2,  # Ramses is Uniswap V3 fork
             "fee_tiers": FEE_TIERS,
         },
-        # "camelot": {
-        #     "factory": CAMELOT_V3_FACTORY,
-        #     "quoter": CAMELOT_V3_QUOTER,
-        #     "fee_tiers": PANCAKE_FEE_TIERS,  # Algebra uses same fee tiers
-        # },
+        "camelot": {
+            "factory": CAMELOT_V3_FACTORY,
+            "quoter": CAMELOT_V3_QUOTER,
+            "fee_tiers": PANCAKE_FEE_TIERS,  # Algebra uses same fee tiers
+        },
     }
     
     cfg = venue_config.get(venue)
@@ -192,7 +192,7 @@ def quote_v3_venue(rpc, token_in, token_out, amount_in, fee, from_addr, venue):
 
 
 def quote_v3_best_multi(rpc, token_in, token_out, amount_in, from_addr,
-                        venues=("uniswap", "sushi", "pancake", "ramses")):
+                        venues=("uniswap", "sushi", "pancake", "ramses", "camelot")):
     """Best executable out across multiple V3 venues and their fee tiers.
     
     Returns (amount_out, fee, pool, venue) or None.
@@ -204,7 +204,7 @@ def quote_v3_best_multi(rpc, token_in, token_out, amount_in, from_addr,
             "sushi": (SUSHI_V3_FACTORY, QUOTER_V2, FEE_TIERS),
             "pancake": (PANCAKE_V3_FACTORY, PANCAKE_QUOTER_V2, PANCAKE_FEE_TIERS),
             "ramses": (RAMSES_V3_FACTORY, QUOTER_V2, FEE_TIERS),
-            # "camelot": (CAMELOT_V3_FACTORY, CAMELOT_V3_QUOTER, PANCAKE_FEE_TIERS),
+            "camelot": (CAMELOT_V3_FACTORY, CAMELOT_V3_QUOTER, PANCAKE_FEE_TIERS),
         }.get(venue)
         
         if not cfg:
