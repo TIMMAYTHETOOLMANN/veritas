@@ -10,13 +10,20 @@ Usage:
     python3 ops/start_engines.py          # start hunter if not running
     python3 ops/start_engines.py --check  # just report status
 """
+import os
+from pathlib import Path
 import subprocess
 import sys
+import time
 
 PY = r"C:\Users\timot\AppData\Local\Programs\Python\Python312\python.exe"
 VERITAS = r"C:\Users\timot\OneDrive\Documents\VERITAS"
 HUNTER = VERITAS + r"\flash_hunter.py"
 HUNTER_OUT = VERITAS + r"\flash_hunter_run.out"
+LIVENESS_LOGS = (
+    "flash_hunter.log", "flash_hunter_run.out", "hunter_stdout.log", "hunter_full.log",
+)
+LIVENESS_MAX_AGE_SEC = 180
 
 PS = (
     "$p = Start-Process -FilePath '{py}' -ArgumentList '{script}' "
@@ -33,6 +40,25 @@ def running(script_name: str) -> list:
          "Select-Object -ExpandProperty ProcessId"],
         capture_output=True, text=True, timeout=60).stdout
     return [int(l) for l in out.split() if l.strip().isdigit()]
+
+
+def newest_log_age() -> float | None:
+    """Age of the newest hunter log; None means no liveness evidence exists."""
+    mtimes = []
+    for name in LIVENESS_LOGS:
+        path = Path(VERITAS) / name
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except FileNotFoundError:
+            pass
+    return None if not mtimes else time.time() - max(mtimes)
+
+
+def stop_pids(pids: list[int]) -> None:
+    """Terminate known stale detached Python hunter processes."""
+    for pid in pids:
+        subprocess.run(["powershell", "-Command", f"Stop-Process -Id {pid} -Force"],
+                       capture_output=True, text=True, timeout=30)
 
 
 def start(script, wd) -> int:
@@ -53,9 +79,18 @@ def main():
         ("hunter", HUNTER, VERITAS, HUNTER_OUT),
     ):
         pids = running(name)
-        if pids:
-            report.append(f"{name}: ALREADY RUNNING pid={pids}")
+        age = newest_log_age() if name == "hunter" else None
+        stale = bool(pids) and (age is None or age > LIVENESS_MAX_AGE_SEC)
+        if pids and not stale:
+            report.append(f"{name}: RUNNING pid={pids} newest_log_age={age:.0f}s")
             continue
+        if pids and stale:
+            detail = "no hunter logs" if age is None else f"newest_log_age={age:.0f}s"
+            if check_only:
+                report.append(f"{name}: STALE pid={pids} {detail}")
+                continue
+            stop_pids(pids)
+            report.append(f"{name}: RESTARTING stale pid={pids} {detail}")
         if check_only:
             report.append(f"{name}: DOWN")
             continue
@@ -66,11 +101,7 @@ def main():
             report.append(f"{name}: START FAILED {e}")
 
     print("\n".join(report))
-    if check_only:
-        sys.exit(0)
-    # exit 1 if anything is down or failed to start
-    bad = any(("DOWN" in r or "FAILED" in r) for r in report)
-    sys.exit(1 if bad else 0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
