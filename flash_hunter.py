@@ -260,21 +260,20 @@ def uint_or_zero(x):
 
 
 def encode_execute_v2(plan):
-    """ABI-encode FlashloanArbV2.execute(params)."""
-    return (keccak(text="execute(uint256,(uint8,address,uint24),(uint8,address,uint24),address)")[:4].hex()
+    """ABI-encode FlashloanArb.execute(params) for V2/V2 edges.
+    Selector: execute(uint256,address,address,address) = 0x5489b4f7
+    Args: (size_weth, poolBuy, poolSell, quoteToken)
+    """
+    return ("5489b4f7"  # execute(uint256,address,addressaddressaddress)
             + int(plan["size_weth"] * 1e18).__format__('064x')
-            + int(plan["buy_kind"]).__format__('064x')
             + plan["buy_venue"][2:].rjust(64, "0")
-            + int(plan["buy_fee"]).__format__('064x')
-            + int(plan["sell_kind"]).__format__('064x')
             + plan["sell_venue"][2:].rjust(64, "0")
-            + int(plan["sell_fee"]).__format__('064x')
             + plan["quote"][2:].rjust(64, "0"))
 
 
 def encode_execute_v3(plan):
     """ABI-encode FlashloanArbV3.execute(params) for triangular routes."""
-    return (keccak(text="execute(uint256,(uint8,address,uint24),(uint8,address,uint24),(uint8,address,uint24),address)")[:4].hex()
+    return (keccak(text="execute(uint256,tuple,tuple,tuple,address)")[:4].hex()
             + int(plan["size_weth"] * 1e18).__format__('064x')
             + int(plan["buy_kind"]).__format__('064x')
             + plan["buy_venue"][2:].rjust(64, "0")
@@ -423,12 +422,8 @@ def sim_edge_on_fork(fork, edge, executor_addr):
         # V2/V2 edge
         calldata = "0x" + encode_execute_v2({
             "size_weth": edge["size_weth"],
-            "buy_kind": edge["buy_kind"],
             "buy_venue": edge["buy_venue"],
-            "buy_fee": edge.get("buy_fee", 3000),
-            "sell_kind": edge["sell_kind"],
             "sell_venue": edge["sell_venue"],
-            "sell_fee": edge.get("sell_fee", 3000),
             "quote": edge["quote"],
         })
     elif edge.get("buy1_kind") is not None:
@@ -527,6 +522,8 @@ def deploy_zk_executor(rpc, acct):
     """Deploy ZKArbExecutor (ZK-proof arb)."""
     from zk_prover import ZKProver
     import json as _json
+    from eth_abi import encode
+    from eth_utils import to_checksum_address
 
     print("[hunter] deploying ZK arb executor...", flush=True)
 
@@ -549,7 +546,7 @@ def deploy_zk_executor(rpc, acct):
     if not raw.startswith("0x"): raw = "0x" + raw
     vtx = vrpc.send_raw(raw)
     v_rcpt = vrpc.wait_receipt(vtx, timeout=300)
-    verifier = v_rcpt["contractAddress"]
+    verifier = to_checksum_address(v_rcpt["contractAddress"][:42].strip())
     print(f"[hunter] Groth16Verifier: {verifier}", flush=True)
 
     # 2) Deploy ZKArbExecutor with verifier address
@@ -557,16 +554,18 @@ def deploy_zk_executor(rpc, acct):
     executor_bin = open("contracts/FlashloanArbV2.bin").read().strip()
     if not executor_bin.startswith("0x"): executor_bin = "0x" + executor_bin
 
-    # constructor(WETH, owner, verifier)
-    WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+    # constructor(address _aavePool, address _v3Router, address _weth)
+    AAVE_POOL = to_checksum_address("0x794a61358D6845594F94dc1DB02A252b5b4814aD")
+    V3_ROUTER = to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
+    WETH_ADDR = to_checksum_address("0x82af49447d8a07e3bd95bd0d56f35241523fbab1")
     constructor_args = encode(["address", "address", "address"],
-                               [WETH, acct.address, verifier])
-    deploy_data = executor_bin + constructor_args[2:]
+                               [AAVE_POOL, V3_ROUTER, WETH_ADDR])
+    deploy_data = executor_bin + constructor_args.hex()[2:]
 
     nonce = vrpc.nonce(acct.address)
     gas_price = int(vrpc.gas_price() * 1.25)
     signed = acct.sign_transaction({
-        "nonce": nonce, "gasPrice": gas_price, "gas": 1_200_000,
+        "nonce": nonce, "gasPrice": gas_price, "gas": 1_800_000,
         "to": None, "value": 0, "data": deploy_data, "chainId": 42161,
     })
     raw = (signed.raw_transaction if hasattr(signed, "raw_transaction")
@@ -574,13 +573,14 @@ def deploy_zk_executor(rpc, acct):
     if not raw.startswith("0x"): raw = "0x" + raw
     etx = vrpc.send_raw(raw)
     e_rcpt = vrpc.wait_receipt(etx, timeout=300)
-    executor = e_rcpt["contractAddress"]
+    executor = to_checksum_address(e_rcpt["contractAddress"][:42].strip())
     print(f"[hunter] ZKArbExecutor: {executor}", flush=True)
 
     # 3) Bind verifier in executor
-    bind_sel = keccak(text="setVerifier(address)")[:4]
-    bind_data = bind_sel + encode(["address"], [verifier])[2:]
+    bind_sel = keccak(text="setVerifier(address)")[:4].hex()
+    bind_data = "0x" + bind_sel + encode(["address"], [verifier]).hex()[2:]
     nonce = vrpc.nonce(acct.address)
+    gas_price = int(vrpc.gas_price() * 1.25)
     signed = acct.sign_transaction({
         "nonce": nonce, "gasPrice": gas_price, "gas": 80_000,
         "to": executor, "value": 0, "data": bind_data, "chainId": 42161,

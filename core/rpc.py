@@ -120,10 +120,28 @@ class RPC:
         return self.call("eth_getCode", [addr, block])
 
     def gas_price(self):
-        return self.call("eth_gasPrice", [])
+        result = self.call("eth_gasPrice", [])
+        if result in ("0x", "", None):
+            return None
+        return int(result, 16)
 
     def nonce(self, addr, block="latest"):
-        return self.call("eth_getTransactionCount", [addr, block])
+        result = self.call("eth_getTransactionCount", [addr, block])
+        if result in ("0x", "", None):
+            return None
+        return int(result, 16)
+
+    def send_raw(self, raw_hex):
+        return self.call("eth_sendRawTransaction", [raw_hex])
+
+    def wait_receipt(self, txhash, timeout=180):
+        import time as _t
+        for _ in range(timeout * 2):
+            r = self.call("eth_getTransactionReceipt", [txhash])
+            if r is not None:
+                return r
+            _t.sleep(0.5)
+        raise RuntimeError(f"tx {txhash} not mined in {timeout}s")
 
 
 def uint(result):
