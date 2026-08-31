@@ -119,6 +119,12 @@ class RPC:
     def get_code(self, addr, block="latest"):
         return self.call("eth_getCode", [addr, block])
 
+    def gas_price(self):
+        return self.call("eth_gasPrice", [])
+
+    def nonce(self, addr, block="latest"):
+        return self.call("eth_getTransactionCount", [addr, block])
+
 
 def uint(result):
     if result in ("0x", "", None):
