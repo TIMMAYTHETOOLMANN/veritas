@@ -50,8 +50,35 @@ interface IAavePool {
     ) external;
 }
 
+// Groth16 verifier (deployed separately from snarkjs export). Signature must
+// match the snarkjs-generated Groth16Verifier exactly (3 public signals).
+interface IVerifier {
+    function verifyProof(
+        uint[2] calldata a,
+        uint[2][2] calldata b,
+        uint[2] calldata c,
+        uint[3] calldata publicSignals
+    ) external view returns (bool);
+}
+
 contract FlashloanArbV2 {
     address public immutable owner;
+
+    // ZK replay protection: a nullifier (public signal 0) may only fire once.
+    mapping(bytes32 => bool) public usedNullifier;
+
+    // Separately-deployed Groth16 verifier. address(0) = ZK path disabled.
+    // A reference (not inheritance) is used deliberately: inheriting the legacy
+    // snarkjs verifier forces via-IR, which miscompiles it (the whole
+    // executeWithProof body is flagged unreachable).
+    address public verifier;
+
+    event VerifierSet(address indexed verifier);
+
+    function setVerifier(address _verifier) external onlyOwner {
+        verifier = _verifier;
+        emit VerifierSet(_verifier);
+    }
     IAavePool public immutable aavePool;
     IV3Router public immutable v3Router;
     address public immutable WETH;
@@ -104,6 +131,35 @@ contract FlashloanArbV2 {
         IERC20(quoteToken).approve(address(v3Router), type(uint256).max);
         bytes memory params = abi.encode(buyLeg, sellLeg, quoteToken);
         aavePool.flashLoanSimple(address(this), WETH, principal, params, 0);
+    }
+
+    /**
+     * ZK-gated entry. Same execution path as execute(), but requires a valid
+     * Groth16 proof first (3 public signals: [nullifier, profit_usd, net_profit_usd]).
+     * The proof certifies a profitable cross-venue state existed without revealing
+     * the route; actual trade profitability is still enforced by NoProfit() below.
+     */
+    function executeWithProof(
+        uint[2] calldata a,
+        uint[2][2] calldata b,
+        uint[2] calldata c,
+        uint[3] calldata publicSignals,
+        uint256 principal,
+        Leg calldata buyLeg,
+        Leg calldata sellLeg,
+        address quoteToken
+    ) external onlyOwner returns (uint256) {
+        require(verifier != address(0), "ZK: no verifier");
+        require(IVerifier(verifier).verifyProof(a, b, c, publicSignals), "ZK: invalid proof");
+        bytes32 nullifier = bytes32(uint256(publicSignals[0]));
+        require(!usedNullifier[nullifier], "ZK: replayed");
+        usedNullifier[nullifier] = true;
+
+        uint256 before = IERC20(WETH).balanceOf(address(this));
+        IERC20(quoteToken).approve(address(v3Router), type(uint256).max);
+        bytes memory params = abi.encode(buyLeg, sellLeg, quoteToken);
+        aavePool.flashLoanSimple(address(this), WETH, principal, params, 0);
+        return IERC20(WETH).balanceOf(address(this)) - before; // residual after repay
     }
 
     function executeOperation(

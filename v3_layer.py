@@ -119,7 +119,8 @@ def quote_v3(rpc, token_in, token_out, amount_in, fee, from_addr, quoter=QUOTER_
             + pad(token_in) + pad(token_out) + u256(amount_in)
             + u256(fee) + u256(0))          # sqrtPriceLimitX96 = 0 (none)
     try:
-        r = rpc.call("eth_call", [{"from": from_addr, "to": quoter,
+        # Hard-capped: a stalled TLS read here used to freeze the scan cycle.
+        r = rpc.call_hard("eth_call", [{"from": from_addr, "to": quoter,
                                    "data": data}, "latest"])
         if not r or r == "0x" or len(r) < 68:
             return None
@@ -225,7 +226,10 @@ def quote_v3_best_multi(rpc, token_in, token_out, amount_in, from_addr,
 # ---- sqrt-price helpers (mid price, display only) -------------------------
 
 def slot0(rpc, pool):
-    r = rpc.eth_call(pool, SEL["slot0"])
+    try:
+        r = rpc.eth_call_hard(pool, SEL["slot0"])
+    except Exception:
+        return None, None
     if not r or len(r) < 130:
         return None, None
     h = r[2:]
@@ -237,7 +241,10 @@ def v3_mid_price(rpc, pool, dec_base=18, dec_quote=6):
     sp, tick = slot0(rpc, pool)
     if not sp:
         return None
-    t0 = parse_addr(rpc.eth_call(pool, SEL["token0"]))
+    try:
+        t0 = parse_addr(rpc.eth_call_hard(pool, SEL["token0"]))
+    except Exception:
+        t0 = None
     # price = (sp/2^96)^2 is token1/token0 raw-decimals
     raw = (sp / 2 ** 96) ** 2
     return raw if t0 and t0.lower().startswith("0x82af") else 1 / raw

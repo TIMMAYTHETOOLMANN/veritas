@@ -1,0 +1,287 @@
+[arb_engine] Token universe: 834 unique tokens, 834 registered
+[arb_engine] WATCHDOG: a scan cycle exceeded 120s — dumping stacks
+Thread 0x00003934 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 850 in create_connection
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1003 in connect
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1472 in connect
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1037 in send
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1093 in _send_output
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1333 in endheaders
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1384 in _send_request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1338 in request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1344 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 40 in eth_call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 146 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00005ea8 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1319 in do_handshake
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1041 in _create
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 455 in wrap_socket
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1479 in connect
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1037 in send
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1093 in _send_output
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1333 in endheaders
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1384 in _send_request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1338 in request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1344 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 50 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x0000164c (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1319 in do_handshake
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1041 in _create
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 455 in wrap_socket
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1479 in connect
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1037 in send
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1093 in _send_output
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1333 in endheaders
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1384 in _send_request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1338 in request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1344 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 50 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00000c60 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1319 in do_handshake
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1041 in _create
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 455 in wrap_socket
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1479 in connect
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1037 in send
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1093 in _send_output
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1333 in endheaders
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1384 in _send_request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1338 in request
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1344 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 50 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00003dc8 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1103 in read
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1251 in recv_into
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 720 in readinto
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 292 in _read_status
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331 in begin
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430 in getresponse
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1348 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 50 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00005494 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1103 in read
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1251 in recv_into
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 720 in readinto
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 292 in _read_status
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331 in begin
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430 in getresponse
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1348 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 50 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00005524 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1103 in read
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1251 in recv_into
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 720 in readinto
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 292 in _read_status
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331 in begin
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430 in getresponse
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1348 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 40 in eth_call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 146 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x000051d0 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1103 in read
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 1251 in recv_into
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 720 in readinto
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 292 in _read_status
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331 in begin
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430 in getresponse
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1348 in do_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 1392 in https_open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 492 in _call_chain
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 532 in _open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 515 in open
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\urllib\request.py", line 215 in urlopen
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 29 in call
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 50 in _run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00006984 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 54 in call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\v3_layer.py", line 123 in quote_v3
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 436 in quote_v3_cached
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 645 in _v3_mid
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 711 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x000059c8 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 54 in call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\v3_layer.py", line 123 in quote_v3
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 436 in quote_v3_cached
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 732 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00000bec (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 54 in call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\v3_layer.py", line 123 in quote_v3
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 436 in quote_v3_cached
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 645 in _v3_mid
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 711 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00001e58 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 54 in call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\v3_layer.py", line 123 in quote_v3
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 436 in quote_v3_cached
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 793 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00005234 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 151 in _eth_call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 271 in _v2_pool_state
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 286 in v2_quote_out
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 735 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x000063a4 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 54 in call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\v3_layer.py", line 123 in quote_v3
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 436 in quote_v3_cached
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 784 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00004e38 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 151 in _eth_call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 271 in _v2_pool_state
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 286 in v2_quote_out
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 735 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00005054 (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 359 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\core\rpc.py", line 54 in call_hard
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\v3_layer.py", line 123 in quote_v3
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 436 in quote_v3_cached
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 645 in _v3_mid
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 711 in _process_quote_group
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1012 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Current thread 0x000050b8 (most recent call first):
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 568 in _wd
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1433 in run
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x0000353c (most recent call first):
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 355 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 655 in wait
+  File "C:\Users\timot\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\_base.py", line 243 in as_completed
+  File "C:\Users\timot\OneDrive\Documents\VERITAS\arb_engine.py", line 854 in scan_cross_venue
+  File "<stdin>", line 6 in <module>
+SCAN_COMPLETE groups=104 edges=0 wall=364.2s
