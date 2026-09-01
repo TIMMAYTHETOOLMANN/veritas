@@ -12,8 +12,13 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
 sys.path.insert(0, str(Path(__file__).parent))
-import arb_engine
 from core.rpc import RPC
+from core.arb_shared import (
+    parse_addr,
+    parse_reserves,
+    WETH,
+    SEL,
+)
 
 # Optional: Verkle registry sync (ShadowPath go-verkle-zk)
 try:
@@ -112,15 +117,14 @@ class ZKProver:
         regardless of the pool's token0/token1 ordering.
         """
         # V2 pool state
-        t0 = arb_engine.parse_addr(self.rpc.eth_call(pool_addr, "0x" + arb_engine.SEL["token0"]))
-        t1 = arb_engine.parse_addr(self.rpc.eth_call(pool_addr, "0x" + arb_engine.SEL["token1"]))
-        r0, r1 = arb_engine.parse_reserves(self.rpc.eth_call(pool_addr, "0x" + arb_engine.SEL["reserves"]))
+        t0 = parse_addr(self.rpc.eth_call(pool_addr, "0x" + SEL["token0"]))
+        t1 = parse_addr(self.rpc.eth_call(pool_addr, "0x" + SEL["token1"]))
+        r0, r1 = parse_reserves(self.rpc.eth_call(pool_addr, "0x" + SEL["reserves"]))
 
         if not t0 or not t1 or r0 is None or r1 is None:
             raise ValueError(f"Invalid pool state for {pool_addr}")
 
         # Reorder reserves so r0 = WETH-side, r1 = quote-side
-        WETH = arb_engine.WETH
         if t0 == WETH:
             weth_r, quote_r = r0, r1
         elif t1 == WETH:

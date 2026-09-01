@@ -19,6 +19,8 @@ Usage:
   python3 arb_engine.py scan --interval 30  # loop with heartbeats
 """
 import argparse
+import os
+import sys
 import time
 import math
 import sqlite3
@@ -28,96 +30,152 @@ from typing import Dict, List, Optional, Tuple, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.rpc import RPC, uint
-from zk_prover import ZKProver # Import the ZKProver class
+from zk_prover import ZKProver
 
 # ---- Configuration ----
-SCAN_INTERVAL_SECONDS = 180 # Target: 3 minutes
-MIN_SAFETY_MARGIN_USD = 0.005 # Minimum 0.5 basis points profit margin target
+SCAN_INTERVAL_SECONDS = 180
+MIN_SAFETY_MARGIN_USD = 0.005
+AAVE_FLASH_FEE = 0.0005
+GAS_UNITS = 350_000
+FORK_URL = "http://127.0.0.1:8545"
+DEFAULT_RPC_URL = "https://arb1.arbitrum.io/rpc"
 # -----------------------
 
-# Initialize global components
 ZK_PROVER: Optional[ZKProver] = None
-
-# ---- verified on-chain 2026-08-23 (verify_arb_venues.py) ---------------
-# NOTE: all addresses stored LOWERCASE — parse_addr() returns lowercase and
-# every comparison in pool_side() is exact-match.
-WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
-USDC = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
-USDCE = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
-UNIV2_FACTORY = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f"
-SUSHI_FACTORY = "0xc35dadb65012ec5796536bd9864ed8773abc74c4"
-AAVE_V3_POOL = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
-
-# ---- EXPANDED DYNAMIC TOKEN UNIVERSE ----
-# Instead of hardcoded 8 tokens, we dynamically discover all tokens from
-# the pool registry DB. This expands coverage from 8 to 834+ tokens.
-# Tokens are verified on-chain at scan time.
 TOKENS = {}
 TOKEN_DECIMALS_CACHE = {}
+PAIR_CACHE: Dict[str, str] = {}
+RECENTLY_PROFITABLE: List[str] = []
 
 # ---- low-level helpers ---------------------------------------------------
 
 def pad_addr(a: str) -> str:
-    """Pads an address string with leading zeros to 64 characters."""
     return a.lower().replace("0x", "").rjust(64, "0")
 
 def parse_addr(result: Optional[str]) -> Optional[str]:
-    """Validates and formats an address string."""
     if not result or len(result) < 66:
         return None
     tail = result[2:][-40:]
     return None if set(tail) == {"0"} else "0x" + tail
 
 def parse_reserves(result: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
-    """Parses the two reserve amounts from a combined string."""
     if not result or result == "0x" or len(result) < 130:
         return None, None
     h = result[2:]
     return int(h[0:64], 16), int(h[64:128], 16)
 
 def univ2_pair(rpc: RPC, factory: str, token_a: str, token_b: str) -> Optional[str]:
-    """Calls the factory contract to get the pair address."""
-    data = "0x" + SEL["getPair"] + pad_addr(token_a) + pad_addr(token_b)
-    return parse_addr(rpc.eth_call(factory, data))
+    try:
+        data = "0x" + SEL["getPair"] + pad_addr(token_a) + pad_addr(token_b)
+        result = rpc.eth_call(factory, data)
+        return parse_addr(result)
+    except Exception:
+        return None
 
-# ---- CORE ARB LOGIC FUNCTIONS ----------------------------------------------
+# ---- Core constants ------------------------------------------------------
+
+WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+USDC = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+USDCE = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
+UNIV2_FACTORY = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f"
+SUSHI_FACTORY = "0xc35dadb65012ec5796536bd9864ed8773abc74c4"
+CAMELOT_FACTORY = "0x6eccab422d763ac031210895c81787e87b43a652"
+AAVE_V3_POOL = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+SEL = {
+    "getPair": "e6a43905",
+    "getReserves": "0902f1ac",
+    "token0": "0dfe1681",
+    "token1": "d21220a7",
+}
+
+# ---- Discovery -----------------------------------------------------------
+
+def discover_tokens_and_pairs(rpc: RPC) -> None:
+    global TOKENS, TOKEN_DECIMALS_CACHE, PAIR_CACHE
+    if TOKENS and PAIR_CACHE:
+        return
+
+    seed_tokens = {
+        WETH: {"address": WETH, "price_usd": 2500.0},
+        USDC: {"address": USDC, "price_usd": 1.0},
+        USDCE: {"address": USDCE, "price_usd": 1.0},
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831": {"address": USDC, "price_usd": 1.0},
+        "0x82af49447d8a07e3bd95bd0d56f35241523fbab1": {"address": WETH, "price_usd": 2500.0},
+        "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8": {"address": USDCE, "price_usd": 1.0},
+        "0x912ce59144191c1204e64559fe8253a0e49e6548": {"address": "0x912ce59144191c1204e64559fe8253a0e49e6548", "price_usd": 1.8},
+        "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f": {"address": "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f", "price_usd": 95000.0},
+        "0xf97f4df75117a78c1a5a0dbb814af92458539fb4": {"address": "0xf97f4df75117a78c1a5a0dbb814af92458539fb4", "price_usd": 12.0},
+        "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0": {"address": "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0", "price_usd": 8.5},
+        "0xd4d42f0b6def4ce0383636770ef773390d85c61a": {"address": "0xd4d42f0b6def4ce0383636770ef773390d85c61a", "price_usd": 1.5},
+        "0x11cdb42b0eb46d95f990bedd4695a6e3fa034978": {"address": "0x11cdb42b0eb46d95f990bedd4695a6e3fa034978", "price_usd": 0.25},
+        "0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a": {"address": "0xfc5a1a6eb076a2c7ad06ed22c90d7e710e35ad0a", "price_usd": 28.0},
+    }
+
+    decimals_cache = {WETH: 18, USDC: 6, USDCE: 6}
+    for addr, meta in list(seed_tokens.items()):
+        try:
+            r = rpc.eth_call(addr, "0x313ce567")
+            d = int(r[2:66], 16) if r and len(r) >= 66 else meta.get("decimals", 18)
+        except Exception:
+            d = 18
+        decimals_cache[addr] = d
+
+    pair_cache = {}
+    discovered_tokens = {}
+    for quote in (WETH, USDC):
+        for base in seed_tokens:
+            if base == quote:
+                continue
+            try:
+                p = univ2_pair(rpc, SUSHI_FACTORY, base, quote)
+                if p:
+                    pair_cache[(base, quote)] = p
+                    pair_cache[(quote, base)] = p
+                    discovered_tokens[base] = seed_tokens[base]
+                    discovered_tokens[quote] = seed_tokens[quote]
+            except Exception:
+                pass
+
+    TOKENS = discovered_tokens
+    TOKEN_DECIMALS_CACHE = decimals_cache
+    PAIR_CACHE = pair_cache
+
+# ---- Scanning ------------------------------------------------------------
 
 def pool_side(rpc: RPC, factory: str, token_a: str, token_b: str,
               reserves_a: int, reserves_b: int) -> Dict[str, Any]:
-    """
-    Calculates the state and initial potential trade metrics for one pair.
-    """
     pair_addr = univ2_pair(rpc, factory, token_a, token_b)
     if not pair_addr:
         return {"pair_addr": None}
 
-    # Fetch the reserves of the pair at this moment
     reserves_tx = rpc.eth_call(pair_addr, SEL["getReserves"])
     reserves_a, reserves_b = parse_reserves(reserves_tx)
 
     if reserves_a is None or reserves_b is None or reserves_a == 0 or reserves_b == 0:
         return {"pair_addr": pair_addr, "reserves_a": reserves_a, "reserves_b": reserves_b}
 
-    # Calculate the effective price: Price(TokenA in terms of TokenB) = Reserves_B / Reserves_A
     price_a_in_b = reserves_b / reserves_a
-    
-    # Calculate the price using USDCE/WETH relationship if one token is USDCE
+
+    def _usd_price(addr: str) -> float:
+        if addr == WETH:
+            return 2500.0
+        if addr in (USDC, USDCE):
+            return 1.0
+        return 0.0
+
+    price_a = _usd_price(token_a)
+    price_b = _usd_price(token_b)
     if token_a == WETH:
-        # Price(WETH in USDC/USDCE) -> Price_B / Price_A
-        price_a_in_b_usd = (tokens[token_b]["price_usd"] / tokens[token_a]["price_usd"])
+        price_a_in_b_usd = price_b / price_a if price_a else 0.0
     elif token_b == WETH:
-        # Price(Token_A in WETH) -> Price_A / Price_B
-        price_a_in_b_usd = (tokens[token_a]["price_usd"] / tokens[token_b]["price_usd"])
-    elif token_a == USDC:
-        # Price(USDC in Token_B) -> Price_B / Price_A
-        price_a_in_b_usd = tokens[token_b]["price_usd"] / tokens[token_a]["price_usd"]
-    elif token_b == USDC:
-        # Price(Token_A in USDC) -> Price_A / Price_B
-        price_a_in_b_usd = tokens[token_a]["price_usd"] / tokens[token_b]["price_usd"]
+        price_a_in_b_usd = price_a / price_b if price_b else 0.0
+    elif token_a in (USDC, USDCE):
+        price_a_in_b_usd = price_b / price_a if price_a else 0.0
+    elif token_b in (USDC, USDCE):
+        price_a_in_b_usd = price_a / price_b if price_b else 0.0
     else:
-        # General pair: USD_A / USD_B
-        price_a_in_b_usd = tokens[token_a]["price_usd"] / tokens[token_b]["price_usd"]
-        
+        price_a_in_b_usd = price_a / price_b if price_b else 0.0
+
     return {
         "pair_addr": pair_addr,
         "token_a": token_a,
@@ -126,202 +184,290 @@ def pool_side(rpc: RPC, factory: str, token_a: str, token_b: str,
         "reserves_b": reserves_b,
         "price_a_in_b": price_a_in_b,
         "price_a_in_b_usd": price_a_in_b_usd,
-        "factory": factory
+        "factory": factory,
     }
 
-def quote_v3_cached(rpc: RPC, weth_addr: str, quote_token_addr: str, 
+def quote_v3_cached(rpc: RPC, weth_addr: str, quote_token_addr: str,
                     trade_amount_a: int, pool_a_addr: str) -> Tuple[int, int]:
-    """
-    Queries Uniswap V3 to get the output amount (Amount B) for a given input 
-    (Amount A) based on constant product formula (x*y = k).
-    Returns (Amount B, Total_k_new_scaled).
-    """
-    # Fetch the pair reserves to calculate K
     try:
         reserves_tx = rpc.eth_call(pool_a_addr, SEL["getReserves"])
         reserves_a, reserves_b = parse_reserves(reserves_tx)
-        
         if reserves_a is None or reserves_b is None or reserves_a == 0 or reserves_b == 0:
             return 0, 0
 
-        # K = Reserves_A * Reserves_B
-        k = reserves_a * reserves_b
-        
-        # Amount_B = (Amount_A * Reserves_B) / (Reserves_A + Amount_A)
         denominator = reserves_a + trade_amount_a
-        
-        # This is the standard formula for output amount B when trading amount A
         amount_b = (trade_amount_a * reserves_b) / denominator
-        
-        # Scale back to integer (18 decimals assumed for standard tokens)
-        scaled_amount_b = int(amount_b * (10**18)) 
-        
-        # New K: K' = (Reserves_A + Amount_A) * (Reserves_B - Amount_B)
+        scaled_amount_b = int(amount_b * (10 ** 18))
         new_k_scaled = (reserves_a + trade_amount_a) * (reserves_b - scaled_amount_b)
-        
         return scaled_amount_b, new_k_scaled
-
     except Exception as e:
         print(f"Error querying V3 quotes for {pool_a_addr}: {e}")
         return 0, 0
 
-def scan_all_pairs(rpc: RPC, tokens: Dict[str, Dict], token_decimals_cache: Dict[str, int]) -> List[Dict[str, Any]]:
-    """
-    Iterates over all known tokens, checks against all known factories, 
-    and scans for profitable pairs.
-    """
-    print(f"[arb_engine] Scanning across {len(tokens)} tokens...")
-    all_edges = []
-    
-    token_names = list(tokens.keys())
-    
-    # 1. Scan Universally (Token vs WETH)
-    for token_a in token_names:
-        if token_a == WETH: continue
-        
-        # --- Trade Direction: A -> B (Input A, Output B) ---
-        
-        # V2 Scan (using SUSHI_FACTORY)
-        try:
-            edge_v2 = pool_side(rpc, SUSHI_FACTORY, token_a, WETH, 0, 0)
-            if edge_v2["pair_addr"]:
-                # Patch token decimals into the edge dict for full context
-                edge_v2["token_a_decimals"] = token_decimals_cache.get(token_a, 18)
-                edge_v2["token_b_decimals"] = token_decimals_cache.get(WETH, 18)
-                all_edges.append(edge_v2)
-        except Exception as e:
-            print(f"Warning: V2 Scan failed for {token_a}/{WETH}: {e}")
-            
-        # V3 Scan (using UNIV2_FACTORY)
-        try:
-            edge_v3 = pool_side(rpc, UNIV2_FACTORY, token_a, WETH, 0, 0)
-            if edge_v3["pair_addr"]:
-                edge_v3["token_a_decimals"] = token_decimals_cache.get(token_a, 18)
-                edge_v3["token_b_decimals"] = token_decimals_cache.get(WETH, 18)
-                all_edges.append(edge_v3)
-        except Exception as e:
-            print(f"Warning: V3 Scan failed for {token_a}/{WETH}: {e}")
+def warm_recent_edges(best_edge: Optional[Dict[str, Any]]) -> None:
+    if not best_edge:
+        return
+    addr = best_edge.get("pair_addr")
+    if not addr:
+        return
+    if addr in RECENTLY_PROFITABLE:
+        RECENTLY_PROFITABLE.remove(addr)
+    RECENTLY_PROFITABLE.insert(0, addr)
+    if len(RECENTLY_PROFITABLE) > 12:
+        RECENTLY_PROFITABLE.pop()
 
-    # 2. Scan Cross-Token Pairs (Token_A vs Token_B)
-    for i in range(len(token_names)):
-        for j in range(i + 1, len(token_names)):
-            token_a = token_names[i]
-            token_b = token_names[j]
-            
-            # Check for identity or WETH already covered
-            if token_a == token_b: continue
-            if token_a == WETH or token_b == WETH: continue 
-                
-            # --- Direction 1: A -> B (Input A, Output B) ---
-            edge_ab_v2 = pool_side(rpc, SUSHI_FACTORY, token_a, token_b, 0, 0)
-            if edge_ab_v2["pair_addr"]:
-                edge_ab_v2["token_a_decimals"] = token_decimals_cache.get(token_a, 18)
-                edge_ab_v2["token_b_decimals"] = token_decimals_cache.get(token_b, 18)
-                all_edges.append(edge_ab_v2)
+def _probe_pair(rpc: RPC, factory: str, token_a: str, token_b: str) -> Optional[Dict[str, Any]]:
+    edge = pool_side(rpc, factory, token_a, token_b, 0, 0)
+    if edge.get("pair_addr"):
+        edge.setdefault("token_a_decimals", TOKEN_DECIMALS_CACHE.get(token_a, 18))
+        edge.setdefault("token_b_decimals", TOKEN_DECIMALS_CACHE.get(token_b, 18))
+    return edge
 
-            # --- Direction 2: B -> A (Input B, Output A) ---
-            edge_ba_v2 = pool_side(rpc, SUSHI_FACTORY, token_b, token_a, 0, 0)
-            if edge_ba_v2["pair_addr"]:
-                edge_ba_v2["token_a_decimals"] = token_decimals_cache.get(token_b, 18) # Token_B is now Input A
-                edge_ba_v2["token_b_decimals"] = token_decimals_cache.get(token_a, 18) # Token_A is now Output B
-                all_edges.append(edge_ba_v2)
-                
-            # V3 cross-pairs
-            edge_ab_v3 = pool_side(rpc, UNIV2_FACTORY, token_a, token_b, 0, 0)
-            if edge_ab_v3["pair_addr"]:
-                edge_ab_v3["token_a_decimals"] = token_decimals_cache.get(token_a, 18)
-                edge_ab_v3["token_b_decimals"] = token_decimals_cache.get(token_b, 18)
-                all_edges.append(edge_ab_v3)
-                
-            edge_ba_v3 = pool_side(rpc, UNIV2_FACTORY, token_b, token_a, 0, 0)
-            if edge_ba_v3["pair_addr"]:
-                edge_ba_v3["token_a_decimals"] = token_decimals_cache.get(token_b, 18) # Token_B is now Input A
-                edge_ba_v3["token_b_decimals"] = token_decimals_cache.get(token_a, 18) # Token_A is now Output B
-                all_edges.append(edge_ba_v3)
-
-    print(f"[arb_engine] Scan complete. Total candidates found: {len(all_edges)}")
-    return all_edges
+def _get_reserves(rpc: RPC, pair_addr: str) -> Tuple[Optional[int], Optional[int]]:
+    try:
+        r = rpc.eth_call(pair_addr, SEL["getReserves"])
+        r0, r1 = parse_reserves(r)
+        max_uint112 = (1 << 112) - 1
+        if r0 is None or r1 is None:
+            return None, None
+        if r0 == 0 or r1 == 0:
+            return None, None
+        if r0 > max_uint112 or r1 > max_uint112:
+            return None, None
+        return r0, r1
+    except Exception:
+        return None, None
 
 
-def select_best_edge(all_edges: List[Dict[str, Any]], min_safety_margin: float) -> Optional[Dict[str, Any]]:
-    """
-    Filters edges against the minimum safety margin and selects the one with the highest
-    Net Margin (Gross Profit - Cost Stack).
-    """
-    profitable_edges = []
-    
-    for edge in all_edges:
-        # 1. Calculate Gross Profit (Assuming 1 Unit of Input Token A is traded)
-        gross_profit_usd = edge['price_a_in_b_usd']
-        
-        # 2. Estimate Costs (Fixed costs per trade)
-        # Aave Fee: 0.05% of Input Token A value
-        cost_aave_fee = gross_profit_usd * AAVE_FLASH_FEE
-        
-        # Gas Cost: Fixed cost (using a generous estimate for complexity)
-        cost_gas_usd = GAS_UNITS * RPC.gas_price # Requires RPC context, assuming it's available in the scope of the call
-        
-        # Safety Margin: Required profit floor (user-defined)
-        cost_safety_margin = min_safety_margin
-        
-        # Total Cost Stack = Aave Fee + Gas Cost + Safety Margin
-        total_cost = cost_aave_fee + cost_gas_usd + cost_safety_margin
-        
-        # 3. Net Margin
-        net_margin_usd = gross_profit_usd - total_cost
-        
-        # 4. Filter: Must clear the safety margin floor
-        if net_margin_usd >= min_safety_margin:
-            edge['gross_profit'] = gross_profit_usd
-            edge['net_margin'] = net_margin_usd
-            edge['total_cost'] = total_cost
-            profitable_edges.append(edge)
+def _cpmm_out(reserve_in: int, reserve_out: int, amount_in: int) -> int:
+    if reserve_in is None or reserve_out is None or amount_in is None:
+        return 0
+    if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
+        return 0
+    amount_in_with_fee = amount_in * 9970
+    numerator = amount_in_with_fee * reserve_out
+    denominator = (reserve_in * 10000) + amount_in_with_fee
+    return numerator // denominator
 
-    if not profitable_edges:
+
+def _quote_edge(rpc: RPC, token_a: str, token_b: str, amount_a: int, factory: str) -> Optional[Dict[str, Any]]:
+    pair_addr = univ2_pair(rpc, factory, token_a, token_b)
+    if not pair_addr:
         return None
+    # Validate pair exists on this fork
+    try:
+        code = rpc.eth_getCode(pair_addr)
+        if not code or code == "0x":
+            return None
+    except Exception:
+        return None
+    r0, r1 = _get_reserves(rpc, pair_addr)
+    if not r0 or not r1:
+        return None
+    # Uniswap V2 getReserves returns reserve0 for token0, reserve1 for token1
+    try:
+        t0 = parse_addr(rpc.eth_call(pair_addr, SEL["token0"]))
+    except Exception:
+        t0 = None
+    if t0 and t0.lower() == token_a.lower():
+        reserve_a, reserve_b = r0, r1
+    else:
+        reserve_a, reserve_b = r1, r0
+    amount_b = _cpmm_out(reserve_a, reserve_b, amount_a)
+    if not amount_b:
+        return None
+    return {
+        "pair_addr": pair_addr,
+        "token_a": token_a,
+        "token_b": token_b,
+        "reserves_a": reserve_a,
+        "reserves_b": reserve_b,
+        "amount_b": amount_b,
+        "factory": factory,
+        "token_a_decimals": TOKEN_DECIMALS_CACHE.get(token_a, 18),
+        "token_b_decimals": TOKEN_DECIMALS_CACHE.get(token_b, 18),
+    }
 
-    # Select the absolute best (highest net margin)
-    best_edge = max(profitable_edges, key=lambda e: e['net_margin'])
-    return best_edge
 
+def _usd_for(addr: str, amount: int) -> float:
+    decimals = TOKEN_DECIMALS_CACHE.get(addr, 18)
+    raw = amount / (10 ** decimals)
+    if addr == WETH:
+        return raw * 2500.0
+    if addr in (USDC, USDCE):
+        return raw * 1.0
+    return 0.0
+
+
+def scan_all_pairs(rpc: RPC, tokens: Dict[str, Dict], token_decimals_cache: Dict[str, int]) -> List[Dict[str, Any]]:
+    if not tokens:
+        discover_tokens_and_pairs(rpc)
+
+    candidates: List[Dict[str, Any]] = []
+    token_names = [WETH, USDC, USDCE] + [k for k in tokens.keys() if k not in (WETH, USDC, USDCE)]
+
+    quote_tokens = [WETH, USDC]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = []
+        for token_a in token_names[:20]:
+            if token_a in quote_tokens:
+                continue
+            for quote in quote_tokens:
+                decimals_a = TOKEN_DECIMALS_CACHE.get(token_a, 18)
+                decimals_quote = TOKEN_DECIMALS_CACHE.get(quote, 18)
+                amount_a = 10 ** decimals_a if quote == WETH else 10 ** decimals_quote
+                futures.append(ex.submit(_quote_edge, rpc, token_a, quote, amount_a, SUSHI_FACTORY))
+                amount_quote = 10 ** decimals_quote if quote == WETH else 10 ** decimals_a
+                futures.append(ex.submit(_quote_edge, rpc, quote, token_a, amount_quote, SUSHI_FACTORY))
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                e = fut.result()
+            except Exception:
+                continue
+            if e:
+                candidates.append(e)
+
+    for c in candidates:
+        key = (c["token_a"], c["token_b"])
+        if key not in PAIR_CACHE and c.get("pair_addr"):
+            PAIR_CACHE[key] = c["pair_addr"]
+
+    print(f"[arb_engine] Scan complete. Total candidates found: {len(candidates)}")
+    return candidates
+
+
+def build_edge(pool_buy: Dict[str, Any], pool_sell: Dict[str, Any], quote_token: str, amount_in: int) -> Dict[str, Any]:
+    out_buy = _cpmm_out(pool_buy.get("reserves_a", 0), pool_buy.get("reserves_b", 0), amount_in)
+    out_sell = _cpmm_out(pool_sell.get("reserves_a", 0), pool_sell.get("reserves_b", 0), out_buy)
+    output_token = pool_sell.get("token_b", quote_token)
+    gross_usd = _usd_for(output_token, out_sell)
+    fee = gross_usd * AAVE_FLASH_FEE
+    gas_wei = 0
+    gas_usd = 0.0
+    try:
+        from core.rpc import RPC as _RPC
+        rpc_tmp = _RPC(FORK_URL, timeout=5, retries=1)
+        gas_wei = rpc_tmp.eth_gasPrice()
+        gas_usd = (gas_wei * GAS_UNITS / 1e18) * 2500.0
+    except Exception:
+        pass
+    cost_usd = fee + gas_usd + MIN_SAFETY_MARGIN_USD
+    net = gross_usd - cost_usd
+    return {
+        "buy_kind": 0,
+        "sell_kind": 0,
+        "pool_buy": pool_buy.get("pair_addr"),
+        "pool_sell": pool_sell.get("pair_addr"),
+        "factory_buy": pool_buy.get("factory"),
+        "factory_sell": pool_sell.get("factory"),
+        "quote_token": quote_token,
+        "token_a": pool_buy.get("token_a"),
+        "token_b": pool_sell.get("token_b"),
+        "size_weth": amount_in / 1e18,
+        "amount_in": amount_in,
+        "amount_out": out_sell,
+        "gross_profit": gross_usd,
+        "net_margin": net,
+        "total_cost": cost_usd,
+        "reserves_a": pool_buy.get("reserves_a", 0),
+        "reserves_b": pool_sell.get("reserves_b", 0),
+        "price_a_in_b_usd": gross_usd,
+        "token_a_decimals": pool_buy.get("token_a_decimals", 18),
+        "token_b_decimals": pool_sell.get("token_b_decimals", 18),
+    }
+
+
+def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int = 12, max_venues_per_quote: int = 8, use_multi_hop: bool = True, use_parallel: bool = True) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not TOKENS:
+        discover_tokens_and_pairs(rpc)
+
+    tokens = list(TOKENS.keys())
+    if WETH in tokens:
+        tokens.remove(WETH)
+    tokens = tokens[:max_venues_per_quote]
+
+    factories = [SUSHI_FACTORY, UNIV2_FACTORY]
+    min_size = 10 ** 18
+    max_size = 10 ** 18
+    sizes = [min_size]
+
+    edges: List[Dict[str, Any]] = []
+    report: List[Dict[str, Any]] = []
+
+    for token_a in tokens:
+        quotes: Dict[str, Dict[str, Any]] = {}
+        for factory in factories:
+            for size in sizes:
+                fb = _quote_edge(rpc, WETH, token_a, size, factory)
+                if fb:
+                    quotes.setdefault("forward", []).append(fb)
+                rb = _quote_edge(rpc, token_a, WETH, size, factory)
+                if rb:
+                    quotes.setdefault("reverse", []).append(rb)
+
+        forward = quotes.get("forward", [])
+        reverse = quotes.get("reverse", [])
+        if len(forward) < 2 or len(reverse) < 2:
+            continue
+
+        for fb in forward:
+            for rb in reverse:
+                if fb.get("factory") == rb.get("factory"):
+                    continue
+                if fb.get("pair_addr") == rb.get("pair_addr"):
+                    continue
+                edge = build_edge(fb, rb, token_a, fb.get("reserves_a", 0))
+                if edge.get("net_margin", 0) > MIN_SAFETY_MARGIN_USD:
+                    edges.append(edge)
+                report.append({
+                    "token": token_a,
+                    "size_weth": edge.get("size_weth"),
+                    "net_margin": edge.get("net_margin"),
+                    "gross_profit": edge.get("gross_profit"),
+                    "buy_factory": fb.get("factory"),
+                    "sell_factory": rb.get("factory"),
+                })
+
+    edges.sort(key=lambda e: e.get("net_margin", 0), reverse=True)
+    report.sort(key=lambda r: r.get("net_margin", 0), reverse=True)
+    return edges, report[:20]
+
+
+def select_best_edge(rpc: RPC, all_edges: List[Dict[str, Any]], min_safety_margin: float) -> Optional[Dict[str, Any]]:
+    try:
+        gas_wei = rpc.eth_gasPrice()
+    except Exception:
+        gas_wei = 0
+    gas_usd = (gas_wei * GAS_UNITS / 1e18) * 2500.0
+
+    viable: List[Dict[str, Any]] = []
+    adaptive_margin = min_safety_margin if RECENTLY_PROFITABLE else max(min_safety_margin * 0.5, 0.001)
+
+    for e in all_edges:
+        gross_usd = float(e.get("gross_profit", 0.0))
+        if gross_usd <= 0:
+            continue
+        fee = gross_usd * AAVE_FLASH_FEE
+        total_cost = fee + gas_usd + adaptive_margin
+        net = gross_usd - total_cost
+        if net >= adaptive_margin:
+            e["total_cost"] = total_cost
+            e["net_margin"] = net
+            viable.append(e)
+
+    if not viable:
+        return None
+    return max(viable, key=lambda e: e["net_margin"])
 
 def prepare_transaction_data(edge: Dict[str, Any], zk_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Maps the best_edge data into the structured inputs required by the ZK proof circuit.
-    """
-    # --- Mapping Check & Transformation ---
-    # The ZK circuit requires:
-    # 1. eth_usd (Price of WETH in USD, e.g., 2500.00 -> 2500000000)
-    # 2. gas_usd (Gas cost in USD, e.g., 0.015 USD -> 15000000)
-    # 3. safety_margin (Min Net Profit USD, e.g., 0.005 USD -> 500000)
-    # 4. state_root (Poseidon Hash of the current state components)
-    # 5. pool_a_addr (Buy venue address)
-    # 6. pool_b_addr (Sell venue address)
-    # 7. reserve_a0 (Pool A reserve, scaled)
-    # 8. trade_amount_a_scaled (The input amount, scaled)
-    
-    # 1. eth_usd: Get WETH price from the edge's USD conversion
-    eth_usd_scaled = int(edge['price_a_in_b_usd'] * 1e6) # Assuming 1e6 scale from circuit definition
-    
-    # 2. gas_usd: Use the edge's calculated total cost, which includes safety margin
-    gas_usd_scaled = int(edge['total_cost'] * 1e6) 
-    
-    # 3. safety_margin: Use the global MIN_SAFETY_MARGIN_USD, scaled
+    eth_usd_scaled = int(edge['price_a_in_b_usd'] * 1e6)
+    gas_usd_scaled = int(edge['total_cost'] * 1e6)
     safety_margin_scaled = int(MIN_SAFETY_MARGIN_USD * 1e6)
-    
-    # 4. state_root: This requires a Poseidon hash of a composite state.
-    state_root = zk_payload['state_root_hash'] # Assume ZKProver calculates this
-    
-    # 5. pool_a_addr (Buy venue)
+    state_root = zk_payload['state_root_hash']
     pool_a_addr = edge['pair_addr']
-    
-    # 6. pool_b_addr (Sell venue)
-    pool_b_addr = edge['pair_addr'] # In the two-pool model, the 'sell' venue is usually the same pair address
-    
-    # 7. reserve_a0 (Pool A reserve, scaled)
+    pool_b_addr = edge['pair_addr']
     reserve_a0 = edge['reserves_a']
-    
-    # Final structure matching the circuit's input signature
+
     tx_data = {
         "eth_usd": eth_usd_scaled,
         "gas_usd": gas_usd_scaled,
@@ -330,195 +476,91 @@ def prepare_transaction_data(edge: Dict[str, Any], zk_payload: Dict[str, Any]) -
         "pool_a_addr": pool_a_addr,
         "pool_b_addr": pool_b_addr,
         "reserve_a0": reserve_a0,
-        "trade_amount_a_scaled": int(1 * (10**edge['token_a_decimals'])), # Always trade 1 unit of Token A, scaled
-        # Added: token_b address for the final transaction call
-        "token_b_address": tokens[edge['token_b']]['address']
+        "trade_amount_a_scaled": int(1 * (10 ** edge.get('token_a_decimals', 18))),
+        "token_b_address": TOKENS.get(edge['token_b'], {}).get('address', edge['token_b'])
     }
     return tx_data
 
-# ---- EXECUTION CONTROL FLOW ---------------------------------------------------
-
 def execute_trade(rpc: RPC, tx_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Executes the trade call using the pre-calculated ZK proof data.
-    Returns (tx_hash, result_message)
-    """
     print("[arb_engine] Executing transaction via ZK-Verifiable call...")
     try:
-        # Execution signature based on the circuit/verifier:
-        # execute(uint256, address poolBuy, address poolSell, address quoteToken) sel 0x5489b4f7; sweepETH() 0xd47f6877.
-        
-        # Parameters mapping:
-        # 1. uint256: trade_amount_a_scaled (Input amount)
-        # 2. address poolBuy: pool_a_addr (The venue where we buy/trade from)
-        # 3. address poolSell: pool_b_addr (The venue where we sell/exit to, typically the same)
-        # 4. address quoteToken: token_b_address (The token we receive/gain from the trade)
-        
-        tx_hash = rpc.eth_send_transaction(
-            transaction={
-                "to": AAVE_V3_POOL,
-                "value": 0, # ETH value being swept from the contract
-                "gasLimit": GAS_UNITS,
-                "data": "0x" + SEL["execute"] + 
-                       pad_addr(tx_data['trade_amount_a_scaled']) + 
-                       pad_addr(tx_data['pool_a_addr']) + 
-                       pad_addr(tx_data['pool_b_addr']) + 
-                       pad_addr(tx_data['token_b_address'])
-            },
-            from_address=HD_WALLET["hunter_address"], # Assuming this is defined globally
+        tx_hash = rpc.eth_sendRawTransaction(
+            "0x" + SEL["execute"] +
+            pad_addr(tx_data['trade_amount_a_scaled']) +
+            pad_addr(tx_data['pool_a_addr']) +
+            pad_addr(tx_data['pool_b_addr']) +
+            pad_addr(tx_data['token_b_address'])
         )
-        
-        # Wait for confirmation
-        receipt = rpc.eth_wait_for_transaction(tx_hash, timeout=120)
-        
-        # Check status
-        status = receipt.get("status")
+        receipt = rpc.wait_for_tx(tx_hash, timeout=120)
+        status = int(receipt.get("status", "0x0"), 16)
         if status == 1:
             print(f"[arb_engine] SUCCESS! Transaction confirmed. Hash: {tx_hash}")
-            # In a production setup, we'd read the *actual* received amount/fees from the receipt here.
             return tx_hash, "Transaction executed successfully and swept ETH."
         else:
-            # Check receipt for failure reason
-            logs = receipt.get("logs", [])
-            if logs:
-                 error_msg = f"Tx failed. Receipt logs found. Check explorer for details. TX Hash: {tx_hash}"
-            else:
-                error_msg = f"Tx failed. No logs found. TX Hash: {tx_hash}"
-            return tx_hash, error_msg
-            
+            return tx_hash, "Tx failed. Check receipt for details."
     except Exception as e:
         print(f"[arb_engine] FATAL ERROR during transaction execution: {e}")
         return "N/A", str(e)
 
-
 def main_loop(rpc: RPC):
-    """
-    The main asynchronous/timed loop for discovery, proof generation, and execution.
-    """
     global ZK_PROVER
-    
-    # 0. Initialization Phase
     print("--- VERITAS Arbitrage Engine Initializing ---")
-    
-    # Populate Tokens & Decimals (Requires RPC calls)
-    print("[arb_engine] Populating token metadata...")
-    # In a real run, this would fetch all tokens/decimals from RPC/DB
-    # Since this is a simulation, we rely on global definitions/mocks.
-    
-    # Initialize ZK Prover (this runs the one-time compilation/setup)
     ZK_PROVER = ZKProver(rpc)
     print("[arb_engine] ZKProver initialized.")
-    
-    # Setup execution environment
-    global HD_WALLET
-    if 'HD_WALLET' not in globals():
-        # This is a placeholder for where HD_WALLET (signer info) should be loaded
-        # We must ensure this variable exists!
-        pass 
-        
-    # Loop Control
+
+    last_execution_time = 0
     while True:
-        start_time = time.time()
-        
-        # --- CYCLE START: SCAN -> PROVE -> EXECUTE ---
-        best_edge, tx_data = None, None
-        
-        # 1. Scan (Search Phase)
+        cycle_start = time.time()
+
         all_edges = scan_all_pairs(rpc, TOKENS, TOKEN_DECIMALS_CACHE)
-        
-        # 2. Select Best Edge & Generate Proof (Selection/Proof Phase)
-        best_edge = select_best_edge(all_edges, MIN_SAFETY_MARGIN_USD)
-        
+        best_edge = select_best_edge(rpc, all_edges, MIN_SAFETY_MARGIN_USD)
+
+        tx_data = None
         if best_edge:
-            print(f"[arb_engine] Executing ZK Proof for edge: {best_edge['pair_addr']}")
-            try:
-                zk_payload = ZK_PROVER.generate_proof(best_edge)
-                tx_data = prepare_transaction_data(best_edge, zk_payload)
-            except Exception as e:
-                print(f"[zk_prover] ** CRITICAL ERROR **: ZK Proof Failed. Skipping execution for this cycle. Error: {e}")
-                tx_data = None
-        else:
-            print("[arb_engine] No profitable edge found this cycle. Skipping ZK generation/execution.")
-        
-        # 3. Execute (Transaction Phase)
+            time_since_last_exec = time.time() - last_execution_time
+            if time_since_last_exec >= SCAN_INTERVAL_SECONDS:
+                print(f"[arb_engine] Executing ZK Proof for edge: {best_edge['pair_addr']}")
+                try:
+                    zk_payload = ZK_PROVER.generate_proof(best_edge)
+                    tx_data = prepare_transaction_data(best_edge, zk_payload)
+                except Exception as e:
+                    print(f"[zk_prover] ** CRITICAL ERROR **: ZK Proof Failed. Error: {e}")
+                    tx_data = None
+            else:
+                remaining = SCAN_INTERVAL_SECONDS - time_since_last_exec
+                print(f"[arb_engine] Profitable edge found, but waiting {remaining:.1f}s before next execution.")
+
         if tx_data:
             tx_hash, result_msg = execute_trade(rpc, tx_data)
-            
-            # Report/Log Result
+            last_execution_time = time.time()
+            warm_recent_edges(best_edge)
+
             print("\n" + "="*60)
             print(f"✅ ARBITRAGE CYCLE COMPLETE ({datetime.now().strftime('%H:%M:%S')})")
             print(f"   -> Selected Edge: {best_edge['pair_addr']} ({best_edge['token_a']} -> {best_edge['token_b']})")
             print(f"   -> Net Margin: {best_edge['net_margin']:.6f} USD")
-            print(f"   -> ZK Hash: {zk_payload['state_root_hash']}")
             print(f"   -> Transaction Hash: {tx_hash}")
             print(f"   -> Result: {result_msg}")
             print("="*60 + "\n")
         else:
             print(f"[arb_engine] Cycle finished, no trade executed.")
 
+        elapsed = time.time() - cycle_start
+        if tx_data:
+            sleep_time = max(0.0, SCAN_INTERVAL_SECONDS - elapsed)
+        else:
+            time_since_last_exec = time.time() - last_execution_time
+            sleep_time = max(0.0, SCAN_INTERVAL_SECONDS - time_since_last_exec)
 
-        # 4. Wait/Sleep for Next Cycle (Enforcing 3-minute target)
-        elapsed_time = time.time() - start_time
-        sleep_time = SCAN_INTERVAL_SECONDS - elapsed_time
-        
         if sleep_time > 0:
-            print(f"[arb_engine] Waiting for {sleep_time:.2f} seconds to maintain {SCAN_INTERVAL_SECONDS}s cycle time...")
+            print(f"[arb_engine] Sleeping {sleep_time:.2f}s until next execution/rescan window...")
             time.sleep(sleep_time)
         else:
-            print(f"[arb_engine] WARNING: Cycle took {elapsed_time:.2f}s. Running immediately next cycle to catch up.")
-            
-# Placeholder for the simulation runner entry point
+            print(f"[arb_engine] Rescanning immediately to preserve execution cadence.")
+
 if __name__ == "__main__":
-    # --- SETUP DUMMY GLOBALS FOR TEST RUN ---
-    
-    # Mock RPC client (must be replaced with actual RPC instance)
-    class MockRPC:
-        def eth_call(self, contract: str, data: str) -> str:
-            # Simple mock logic based on known calls
-            if "getPair" in data:
-                # Mock return: returns a standardized pair address format
-                return "0x" + "a" * 64
-            elif "getReserves" in data:
-                # Mock return: reserves A (1e18 * 1.5 USD) and B (1e18 * 2.5 USD)
-                # Since tokens are 18dp, reserves are scaled by 1e18
-                return "0x0100000000000000000000000000000000000000000000000000000000000000"
-            return "0x" + "00" * 64
-
-        def eth_send_transaction(self, transaction: Dict) -> str:
-            # Mock tx hash generation
-            return f"0x{hex(hash(str(transaction)) & 0xFFFFFFFFFFFFFFF))[2:].zfill(64)}"
-            
-        def eth_wait_for_transaction(self, tx_hash: str, timeout: int) -> Dict[str, Any]:
-            # Mock confirmation: Status 1 = Success
-            return {"status": 1, "logs": [{"address": "0x..."}]}
-
-    RPC = MockRPC()
-    
-    # Mock Wallet/Signer Info
-    HD_WALLET = {"hunter_address": "0x73877a40dc3ec68f7883260647c152f25416e7c3"}
-    
-    # Mock Token Data (We must populate this before running the loop)
-    TOKENS = {
-        "WETH": {"address": WETH, "price_usd": 2500.00},
-        "USDC": {"address": USDC, "price_usd": 1.00},
-        "USDCE": {"address": USDCE, "price_usd": 1.00},
-    }
-    
-    # Mock Token Decimals (assuming all tokens are 18dp for simplicity)
-    TOKEN_DECIMALS_CACHE = {
-        "WETH": 18,
-        "USDC": 6, # USDC is 6dp
-        "USDCE": 6, # USDCE is 6dp
-    }
-    
-    # Inject the tokens dict into the global scope where other functions expect it
-    globals()['tokens'] = TOKENS
-    globals()['token_decimals_cache'] = TOKEN_DECIMALS_CACHE
-    globals()['HD_WALLET'] = HD_WALLET
-
-    # Run the main loop
     try:
-        main_loop(RPC)
+        main_loop(RPC(FORK_URL, timeout=20, retries=3))
     except KeyboardInterrupt:
         print("\n--- VERITAS Engine Shutdown Initiated by User ---")
     except Exception as e:

@@ -45,6 +45,7 @@ AAVE_V3_POOL = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 V3_ROUTER   = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"  # SwapRouter02
 
 FORK_RPCS = [
+    "http://127.0.0.1:8545",
     "https://arb1.arbitrum.io/rpc",
     "https://arbitrum-one.publicnode.com",
     "https://gateway.tenderly.co/public/arbitrum",
@@ -74,7 +75,7 @@ def free_port():
 
 
 def kill_tree(proc):
-    if proc.poll() is not None:
+    if proc is None or proc.poll() is not None:
         return
     try:
         if os.name == "nt":
@@ -97,13 +98,23 @@ def launch_fork():
     anvil = find_anvil()
     if not anvil:
         raise RuntimeError("anvil not found (install Foundry)")
+    local_url = "http://127.0.0.1:8545"
+    try:
+        local = RPC(local_url, timeout=5, retries=1)
+        head = local.eth_blockNumber()
+        if head:
+            return None, local_url, head, local_url
+    except Exception:
+        pass
     fork_url = None
     head = None
     rpc = None
     for url in FORK_RPCS:
+        if url == local_url:
+            continue
         try:
             r = RPC(url, timeout=30, retries=2)
-            head = uint(r.call("eth_blockNumber", []))
+            head = r.eth_blockNumber()
             if head:
                 fork_url = url
                 rpc = r
@@ -124,7 +135,7 @@ def launch_fork():
     for _ in range(100):
         try:
             local = RPC(host, timeout=5, retries=1)
-            if uint(local.call("eth_blockNumber", [])):
+            if local.eth_blockNumber():
                 return proc, host, head, fork_url
         except Exception:
             time.sleep(0.3)
@@ -241,7 +252,7 @@ class Fork:
     def deploy_contract(self, binhex, deployer):
         data = binhex if binhex.startswith("0x") else "0x" + binhex
         h = self.req("eth_sendTransaction", [{
-            "from": deployer, "data": data, "value": "0x"}])
+            "from": deployer, "data": data, "value": "0x", "gas": "0x500000"}])
         r = self.wait_tx(h)
         if r.get("status") != "0x1":
             raise RuntimeError("deploy failed: " + json.dumps(r)[:300])

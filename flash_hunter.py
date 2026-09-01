@@ -179,7 +179,7 @@ def _eth_usd_from_v2(rpc):
     return 2450.0  # hardcoded fallback
 
 
-def hunt_once(rpc, acct, executor_addr, rpc_scan, verbose=True):
+def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
     """One hunt cycle: registry cross-venue scan -> ZK-proof gate -> broadcast.
     Returns a cycle summary dict.
     """
@@ -260,15 +260,15 @@ def uint_or_zero(x):
 
 
 def encode_execute_v2(plan):
-    """ABI-encode FlashloanArb.execute(params) for V2/V2 edges.
+    """ABI-encode FlashloanArb.execute(params) for V1 executor flat ABI.
     Selector: execute(uint256,address,address,address) = 0x5489b4f7
     Args: (size_weth, poolBuy, poolSell, quoteToken)
     """
-    return ("5489b4f7"  # execute(uint256,address,addressaddressaddress)
+    return ("5489b4f7"
             + int(plan["size_weth"] * 1e18).__format__('064x')
-            + plan["buy_venue"][2:].rjust(64, "0")
-            + plan["sell_venue"][2:].rjust(64, "0")
-            + plan["quote"][2:].rjust(64, "0"))
+            + plan["poolBuy"][2:].rjust(64, "0")
+            + plan["poolSell"][2:].rjust(64, "0")
+            + plan["quoteToken"][2:].rjust(64, "0"))
 
 
 def encode_execute_v3(plan):
@@ -425,9 +425,9 @@ def sim_edge_on_fork(fork, edge, executor_addr):
         # V2/V2 edge
         calldata = "0x" + encode_execute_v2({
             "size_weth": edge["size_weth"],
-            "buy_venue": edge["buy_venue"],
-            "sell_venue": edge["sell_venue"],
-            "quote": edge["quote"],
+            "poolBuy": edge.get("pool_buy") or edge.get("poolBuy"),
+            "poolSell": edge.get("pool_sell") or edge.get("poolSell"),
+            "quoteToken": edge.get("quote_token") or edge.get("quoteToken") or WETH,
         })
     elif edge.get("buy1_kind") is not None:
         # 3-leg V3
