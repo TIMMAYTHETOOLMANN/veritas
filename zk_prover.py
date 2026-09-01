@@ -309,7 +309,7 @@ def prove_edge(edge: Dict, rpc: RPC, eth_usd: float, gas_usd: float) -> Optional
 if __name__ == "__main__":
     # Test mode
     from core.rpc import RPC
-    rpc = RPC("https://arb1.arbitrum.io/rpc", timeout=60, retries=3)
+    rpc = RPC("https://gateway.tenderly.co/public/arbitrum", timeout=60, retries=3)
     prover = ZKProver(rpc)
     print("[zk_prover] Ready. Proving key:", PROVING_KEY.exists())
     print("[zk_prover] Verification key:", VERIFICATION_KEY.exists())

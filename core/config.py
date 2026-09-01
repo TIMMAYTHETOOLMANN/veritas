@@ -37,7 +37,7 @@ class Config:
              "https://ethereum-sepolia-rpc.publicnode.com", dict(EVENT_TOPICS), 0),
             # L2s — ZK protocol activity centers
             (42161, "arbitrum",
-             "https://arb1.arbitrum.io/rpc", dict(EVENT_TOPICS), 0),
+             "https://gateway.tenderly.co/public/arbitrum", dict(EVENT_TOPICS), 0),
             (10, "optimism",
              "https://mainnet.optimism.io", dict(EVENT_TOPICS), 0),
             (324, "zksync",
@@ -84,7 +84,7 @@ class Config:
             ],
             # L2 fleets — public endpoints, no API keys required
             42161: [  # Arbitrum
-                "https://arb1.arbitrum.io/rpc",
+                "https://gateway.tenderly.co/public/arbitrum",
                 "https://arbitrum.drpc.org",
                 "https://arbitrum.publicnode.com",
             ],

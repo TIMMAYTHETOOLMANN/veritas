@@ -64,8 +64,11 @@ HOT_WALLET = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
 SECRET_FILE = os.path.join(HERE, ".hot_secret")
 
 BROADCAST_RPCS = [
-    "https://arb1.arbitrum.io/rpc",
-    "https://arbitrum-one.publicnode.com",
+    "https://gateway.tenderly.co/public/arbitrum",
+]
+
+SCAN_RPCS = [
+    "http://127.0.0.1:8545",
     "https://gateway.tenderly.co/public/arbitrum",
 ]
 
@@ -97,9 +100,10 @@ def get_rpc():
     for url in BROADCAST_RPCS:
         try:
             r = RPC(url)
-            r.gas_price()  # connectivity probe
+            r.eth_gasPrice()  # connectivity probe
             return r, url
-        except Exception:
+        except Exception as e:
+            log_event({"event": "rpc_probe_failed", "url": url, "error": str(e)[:300]})
             continue
     raise RuntimeError("all broadcast RPCs failed")
 
@@ -184,9 +188,19 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
     Returns a cycle summary dict.
     """
     cycle_start = time.time()
+    # Prefer local fork for scanning if available; fall back to public
+    # scan endpoints so read traffic does not depend on the broadcast fleet.
     from core.rpc import RPC as Vrpc
-    import v3_layer
-    r = Vrpc(rpc_scan, timeout=120, retries=3)
+    r = None
+    for url in SCAN_RPCS:
+        try:
+            r = Vrpc(url, timeout=120, retries=1)
+            r.eth_blockNumber()
+            break
+        except Exception:
+            continue
+    if r is None:
+        r = Vrpc(rpc_scan, timeout=120, retries=3)
     # ETH price + gas from a reliable V2 pool (V3 pools have stale prices)
     # Use Sushi WETH/USDC pool for ground truth price
     SUSHI_WETH_USDC = "0x57b85fef094e10b5eecdf350af688299e9553378"
@@ -203,7 +217,7 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
         out = v3_layer.quote_v3(r, v3_layer.WETH, v3_layer.USDC, 10**18, 500,
                                 acct.address)
         eth_usd = out / 1e6 if out else 2450.0
-    gas_wei = uint_or_zero(r.call("eth_gasPrice", []))
+    gas_wei = uint_or_zero(r.eth_gasPrice())
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     try:
         edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,

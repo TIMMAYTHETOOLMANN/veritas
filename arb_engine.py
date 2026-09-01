@@ -38,7 +38,7 @@ MIN_SAFETY_MARGIN_USD = 0.005
 AAVE_FLASH_FEE = 0.0005
 GAS_UNITS = 350_000
 FORK_URL = "http://127.0.0.1:8545"
-DEFAULT_RPC_URL = "https://arb1.arbitrum.io/rpc"
+DEFAULT_RPC_URL = "https://gateway.tenderly.co/public/arbitrum"
 # -----------------------
 
 ZK_PROVER: Optional[ZKProver] = None

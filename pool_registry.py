@@ -380,7 +380,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["curated", "camelot", "fresh",
                                       "stats", "enrich"])
-    ap.add_argument("--rpc", default="https://arb1.arbitrum.io/rpc")
+    ap.add_argument("--rpc", default="https://gateway.tenderly.co/public/arbitrum")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-pairs", type=int, default=0,
                     help="process at most this many pairs this run (chunked mode)")

@@ -45,10 +45,9 @@ AAVE_V3_POOL = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
 V3_ROUTER   = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"  # SwapRouter02
 
 FORK_RPCS = [
-    "http://127.0.0.1:8545",
-    "https://arb1.arbitrum.io/rpc",
-    "https://arbitrum-one.publicnode.com",
     "https://gateway.tenderly.co/public/arbitrum",
+    "https://arbitrum.drpc.org",
+    "https://arbitrum.publicnode.com",
 ]
 
 GAS_MULTIPLIER = 1.0     # aligned with flash_hunter.py — break-even+ edges pass
