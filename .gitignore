@@ -1,17 +1,25 @@
-# .gitignore — VERITAS: ignore cache, WAL files, pycache, binaries
+# .gitignore — VERITAS: ignore cache, WAL files, pycache, binaries, runtime logs
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.py.bak
+
+# SQLite + WAL
+*.db
 *.db-shm
 *.db-wal
-*.db
+
+# Build / cache / dist
 cache/
 .cache/
 *.egg-info/
 *.egg
 dist/
 build/
-*.whl
+
+# Native
 *.so
 *.dylib
 *.dll
@@ -22,6 +30,16 @@ build/
 *.obj
 *.o
 *.class
+
+# Editor
+.project
+.idea/
+*.iml
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Secrets (already in-repo as .hl_secret/.hot_secret, ignore accidental re-add)
 .env
 .env.*
 *.tfstate*
@@ -34,24 +52,50 @@ build/
 secrets/
 *.secret
 *.token
+
+# Config
 *.cfg
 *.ini
+
+# Runtime / log files (NEVER commit these again)
 *.log
+*.out
 *.bak
 *.swp
 *.swo
 *~
-.project
-.idea/
-*.iml
-.vscode/
-*.sublime-project
-*.sublime-workspace
+scan_bench*.txt
+scan_test*.log
+hunter_*.log
+hunter_*.txt
+hunter_stdout.log
+flash_hunter.log
+flash_hunter_run.out
+output.log
+build.log
+debug_scan_output.txt
+_proof_marker.json
+_PLAN.md
+OPTIMIZATION_PLAN.md
+FINAL_STATUS.md
 
+# Hot-path secrets tracked in repo
 .hl_secret
 .hot_secret
-
-# runtime + secrets
 burner_wallet_bundle.json
-flash_hunter_run.out
-*.out
+
+# Node / JS (the Python engine does not need node_modules)
+node_modules/
+package-lock.json
+
+# Archived experiments
+hyperliquid/
+shadowpath-go-verkle-zk/
+zk-scanner/
+test_circom/
+test_circom_simple/
+circom_bin/
+tools/
+ops/
+utility_bills/
+.archive/
