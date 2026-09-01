@@ -743,6 +743,15 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
                            "venue_sell": b_sell[0]}
                     loan_fee_usd = size * eth_usd * AAVE_FLASH_FEE
                     net = profit * eth_usd - gas_usd - loan_fee_usd
+                    # Pull live V2 reserves for the prover (Z2 supply: both venues
+                    # are V2 pairs only — V3 routes go through the sim-gate path).
+                    # V3 venues carry reserve_*=0 and the prover treats them as
+                    # unsupplied. Cheap (4s TTL cache hit).
+                    _r0a = _r1a = _r0b = _r1b = 0
+                    if b_buy[1] == 0:
+                        _t0, _t1, _r0a, _r1a = _v2_pool_state(rpc, b_buy[2]) or (None, None, 0, 0)
+                    if b_sell[1] == 0:
+                        _t0, _t1, _r0b, _r1b = _v2_pool_state(rpc, b_sell[2]) or (None, None, 0, 0)
                     row.update({
                         "size_weth": round(size, 6),
                         "gross_usd": round(profit * eth_usd, 4),
@@ -752,6 +761,9 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
                         "buy_kind": b_buy[1], "buy_venue": b_buy[2], "buy_fee": b_buy[3],
                         "sell_kind": b_sell[1], "sell_venue": b_sell[2], "sell_fee": b_sell[3],
                         "quote": quote,
+                        # ZK input reserves (raw token units, 0 for V3 legs)
+                        "reserve_a0": _r0a, "reserve_a1": _r1a,
+                        "reserve_b0": _r0b, "reserve_b1": _r1b,
                     })
                     if net > SAFETY_MARGIN_USD:
                         row["edge"] = True

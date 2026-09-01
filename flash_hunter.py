@@ -321,7 +321,7 @@ def execute_zk_edges(rpc, acct, executor_addr, edges, eth_usd, gas_usd):
             continue
 
         print(f"[hunter] ZK-PROOF SUCCESS: profit=${proof['profit_usd']:.4f} "
-              f"net=${proof['net_profit_usd']:.4f} nullifier={proof['nullifier'][:16]}...", flush=True)
+              f"net=${proof['net_profit_usd']:.4f} nullifier=0x{int(proof['nullifier']):064x}...", flush=True)
 
         # Build arb calldata (hidden from mempool - only submitted after proof verified on-chain)
         if edge.get("buy1_kind") is not None:
@@ -368,13 +368,16 @@ def broadcast_zk_execution(rpc, acct, executor_addr, proof, edge):
     sell_leg = (edge["sell_kind"], edge["sell_venue"], edge.get("sell_fee", 3000))
     quote_token = edge["quote"]
 
-    arb_calldata = encode(["(uint8,address,uint24)", "(uint8,address,uint24)", "address"],
-                          [buy_leg, sell_leg, quote_token])
-
-    # Build full calldata: executeWithProof(a, b, c, publicSignals, arbCalldata)
-    selector = keccak(text="executeWithProof(uint256[2],uint256[2][2],uint256[2],uint256[3],bytes)")[:4]
-    calldata = selector + encode(["uint256[2]", "uint256[2][2]", "uint256[2]", "uint256[3]", "bytes"],
-                                  [a, b, c, public_signals, arb_calldata])
+    # Contract signature: executeWithProof(uint[2],uint[2][2],uint[2],uint[3],
+    #                                    uint256,Leg,Leg,address)
+    # The 4 proof args are followed by the arb execution args directly (no
+    # abi.encode wrapper). Keep parity with FlashloanArbV2.executeWithProof.
+    selector = keccak(text="executeWithProof(uint256[2],uint256[2][2],uint256[2],uint256[3],uint256,(uint8,address,uint24),(uint8,address,uint24),address)")[:4]
+    calldata = selector + encode(
+        ["uint256[2]", "uint256[2][2]", "uint256[2]", "uint256[3]",
+         "uint256", "(uint8,address,uint24)", "(uint8,address,uint24)", "address"],
+        [a, b, c, public_signals, principal, buy_leg, sell_leg, quote_token],
+    )
 
     # Broadcast via rotation
     for url in BROADCAST_RPCS:

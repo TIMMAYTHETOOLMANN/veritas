@@ -105,15 +105,30 @@ class ZKProver:
         return None
     
     def _fetch_pool_state(self, pool_addr: str) -> Dict:
-        """Fetch live reserves + build Verkle witness."""
+        """Fetch live reserves + build Verkle witness.
+
+        Returns reserves ordered as (weth_side, quote_side) so the prover can
+        feed the circuit's reserve_a0=WETH, reserve_a1=quote convention
+        regardless of the pool's token0/token1 ordering.
+        """
         # V2 pool state
         t0 = arb_engine.parse_addr(self.rpc.eth_call(pool_addr, "0x" + arb_engine.SEL["token0"]))
         t1 = arb_engine.parse_addr(self.rpc.eth_call(pool_addr, "0x" + arb_engine.SEL["token1"]))
         r0, r1 = arb_engine.parse_reserves(self.rpc.eth_call(pool_addr, "0x" + arb_engine.SEL["reserves"]))
-        
+
         if not t0 or not t1 or r0 is None or r1 is None:
             raise ValueError(f"Invalid pool state for {pool_addr}")
-        
+
+        # Reorder reserves so r0 = WETH-side, r1 = quote-side
+        WETH = arb_engine.WETH
+        if t0 == WETH:
+            weth_r, quote_r = r0, r1
+        elif t1 == WETH:
+            weth_r, quote_r = r1, r0
+        else:
+            # Pool doesn't involve WETH — shouldn't happen for our edges
+            raise ValueError(f"Pool {pool_addr} has no WETH side")
+
         # Get Verkle witness from registry (real KZG or placeholder)
         verkle_data = {"verkle_root": 0, "verkle_witness": [0]*32, "verkle_path": [0]*5}
         
@@ -132,7 +147,7 @@ class ZKProver:
             verkle_data = self._compute_placeholder_verkle(pool_addr, t0, t1, r0, r1)
         
         return {
-            "token0": t0, "token1": t1, "r0": r0, "r1": r1,
+            "token0": t0, "token1": t1, "r0": weth_r, "r1": quote_r,
             **verkle_data,
         }
     
@@ -146,12 +161,24 @@ class ZKProver:
             "verkle_witness": [root] * 32,
             "verkle_path": [root] * 5,
         }
-    
-    def _get_block_state_root(self) -> int:
-        """Get current block hash as state root for proof binding."""
-        block = self.rpc.call("eth_getBlockByNumber", ["latest", False])
-        return int(block["hash"], 16)
-    
+
+    def _compute_state_root(self, pool_a: str, state_a: Dict, pool_b: str, state_b: Dict) -> int:
+        """Compute circuit-compatible state_root via poseidon_helper.mjs."""
+        helper = (CIRCUITS_DIR / "poseidon_helper.mjs").as_posix()
+        path_a0, path_a1 = state_a["verkle_path"][0], state_a["verkle_path"][1]
+        path_b0, path_b1 = state_b["verkle_path"][0], state_b["verkle_path"][1]
+        cmd = [
+            "node", helper, "stateRoot",
+            str(int(pool_a, 16)), str(state_a["r0"]), str(state_a["r1"]),
+            str(path_a0), str(path_a1),
+            str(int(pool_b, 16)), str(state_b["r0"]), str(state_b["r1"]),
+            str(path_b0), str(path_b1),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(f"poseidon_helper failed: {result.stderr}")
+        return int(result.stdout.strip())
+
     def generate_proof(self, edge: Dict, eth_usd: float, gas_usd: float) -> Optional[Dict]:
         """
         Generate Groth16 proof for a vetted edge.
@@ -161,14 +188,23 @@ class ZKProver:
             pool_a = edge["buy_venue"]
             pool_b = edge["sell_venue"]
             size_weth = edge["size_weth"]
-            fee_a = edge.get("buy_fee", 30) * 100  # 30 bps -> 3000
-            fee_b = edge.get("sell_fee", 30) * 100
+            buy_kind = edge.get("buy_kind", 0)
+            sell_kind = edge.get("sell_kind", 0)
+            # Circuit fee_a/fee_b: plain bps. V2 CPMM = 0.3% = 30 bps.
+            # V3 fee tiers are stored as hundredths-of-bps (500 = 0.05%),
+            # so divide by 10 to get bps (500 -> 50).
+            fee_a = 30 if buy_kind == 0 else int(edge.get("buy_fee", 0)) // 10
+            fee_b = 30 if sell_kind == 0 else int(edge.get("sell_fee", 0)) // 10
             
             # Fetch live state + witnesses
             state_a = self._fetch_pool_state(pool_a)
             state_b = self._fetch_pool_state(pool_b)
-            state_root = self._get_block_state_root()
-            
+
+            # Compute Poseidon(2)(Poseidon(5)(A), Poseidon(5)(B)) via the JS helper.
+            # The circuit requires state_root to equal this commitment exactly,
+            # not the block hash.
+            state_root = self._compute_state_root(pool_a, state_a, pool_b, state_b)
+
             # Build input.json for snarkjs
             input_data = {
                 "eth_usd": int(eth_usd * 1e6),
@@ -235,9 +271,11 @@ class ZKProver:
             return {
                 "proof": proof,
                 "public_signals": public,
-                "nullifier": public[-1],
-                "profit_usd": float(public[0]) / 1e6,
-                "net_profit_usd": float(public[1]) / 1e6,
+                # Circuit output order: [nullifier, profit_usd, net_profit_usd]
+                # Public signal 0 = nullifier (must match contract's bytes32(uint256(publicSignals[0])))
+                "nullifier": public[0],
+                "profit_usd": float(public[1]) / 1e6,
+                "net_profit_usd": float(public[2]) / 1e6,
             }
             
         except Exception as e:
