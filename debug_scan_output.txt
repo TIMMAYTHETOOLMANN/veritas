@@ -1,0 +1,6 @@
+Using RPC: https://arb1.arbitrum.io/rpc
+Account: 0x1a0d467974E70e3c1a2b7b84Fec21183Fc4eB60f
+ETH/USD price from Sushi: 0.0
+Gas price: 20004000 wei, gas cost in USD: 0.0
+Calling scan_cross_venue...
+[arb_engine] Token universe: 834 unique tokens, 834 registered
