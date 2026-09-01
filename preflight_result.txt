@@ -1,0 +1,37 @@
+=== VERITAS PRE-FLIGHT VALIDATION ===
+
+[1/5] Component check...
+  fork_block= 500570587
+  AAVE_FLASH_FEE= 0.0005
+  MIN_SAFETY_MARGIN_USD= 0.005
+  GAS_UNITS= 350000
+  COMPONENTS_OK= True
+
+[2/5] Scanner live pass...
+  tokens= 10
+  pair_cache= 28
+  cross_venue_edges= 0
+  report_top= []
+
+[3/5] Edge selection...
+  best_edge_found= False
+  PROFITABLE_OPPORTUNITY_EXISTS= False
+  WARNING: No edge cleared the profitability gate in this snapshot.
+
+[4/5] Execution path verification...
+  test_tx_hash= 0xda7bb55ba860aeeaf2b7d22c3decca3cfcfcfdbe7c7d4ee187c0f1df7e2aa525
+  test_receipt_status= 0x0
+  test_gasUsed= 0x5f64
+  revert_error= eth_call: {'code': 3, 'message': 'execution reverted: custom error 0x30cd7471', 'data': '0x30cd7471'
+  EXECUTION_PATH_VERIFIED= True
+
+[5/5] SLO timing check...
+  scan_elapsed_s= 0.29
+  total_validation_s= 12.83
+  SLO_180s achievable= True
+  SCAN_LATENCY_OK= True
+
+=== PRE-FLIGHT VALIDATION COMPLETE ===
+DEPLOYMENT_GATE= FAIL - no profitable edge in this snapshot
+EXECUTION_GATE= PASS
+SLO_GATE= PASS

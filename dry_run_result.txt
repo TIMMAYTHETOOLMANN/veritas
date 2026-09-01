@@ -1,0 +1,16 @@
+=== VERITAS DRY RUN ===
+fork_block= 500570611
+time= 2026-09-01 02:43:26
+tokens= 10
+pair_cache= 28
+cross_venue_edges= 0
+report_top= []
+
+=== CANDIDATE EDGES ===
+=== BEST EDGE ANALYSIS ===
+best_edge_found= False
+PROFITABLE_OPPORTUNITY_EXISTS= False
+no_candidates_found
+
+=== DRY RUN COMPLETE ===
+RECOMMENDATION: Review top candidates above. If gaps are small (<$0.10), system is launch-ready with minor tuning.
