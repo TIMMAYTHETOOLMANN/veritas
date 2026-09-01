@@ -314,8 +314,18 @@ def pool_liquidity_cached(rpc, conn, addr):
                 return r[0] if r and r[0] else None
         except Exception:
             pass
-    import v3_layer
-    L = v3_layer.pool_liquidity(rpc, addr)
+    # V3 liquidity/liquidity-layer check is now best-effort.
+    try:
+        import v3_layer as vl
+    except Exception:
+        vl = None
+    if vl is not None:
+        try:
+            L = vl.pool_liquidity(rpc, addr)
+        except Exception:
+            L = None
+    else:
+        L = None
     if L is None:
         L = 0
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -383,7 +393,9 @@ def _load_registry_pools(rpc):
 def _check_v3_pool_live(rpc, pool_addr):
     """True if the V3 pool has real liquidity (>= MIN_POOL_LIQUIDITY)."""
     try:
-        import v3_layer as vl
+        import v3_layer as vl  # type: ignore[no-redef]
+        if vl is None:
+            return False
         L = vl.pool_liquidity(rpc, pool_addr)
         return L is not None and L >= vl.MIN_POOL_LIQUIDITY
     except Exception:
@@ -526,7 +538,12 @@ def scan_cross_venue(rpc, eth_usd, gas_usd, size_steps=12, max_venues_per_quote=
 
     Returns (edges, report) where edges contain profit > safety margin.
     """
-    import v3_layer
+    try:
+        import v3_layer
+    except Exception:
+        v3_layer = None
+    if v3_layer is None:
+        return edges, report
 
     # Refresh token universe dynamically (once per scan cycle)
     refresh_token_universe(rpc)
@@ -774,7 +791,10 @@ def parallel_scan_edges(edges_list, rpc, max_workers=4):
         """Verify a single edge on a specific RPC endpoint."""
         try:
             r = RPC(rpc_url, timeout=15, retries=1)
-            import v3_layer
+            try:
+                import v3_layer as vl  # type: ignore[no-redef]
+            except Exception:
+                vl = None
             from_addr = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
 
             buy_kind = edge["buy_kind"]
@@ -791,7 +811,9 @@ def parallel_scan_edges(edges_list, rpc, max_workers=4):
 
             # Verify buy leg
             if buy_kind == 1:  # V3
-                mid = v3_layer.quote_v3(r, WETH, quote, amt, buy_fee, from_addr)
+                if vl is None:
+                    return False
+                mid = vl.quote_v3(r, WETH, quote, amt, buy_fee, from_addr)
             else:  # V2
                 mid = v2_quote_out(r, buy_venue, WETH, quote, amt, q_dec=q_dec)
 
@@ -800,7 +822,9 @@ def parallel_scan_edges(edges_list, rpc, max_workers=4):
 
             # Verify sell leg
             if sell_kind == 1:  # V3
-                back = v3_layer.quote_v3(r, quote, WETH, mid, sell_fee, from_addr)
+                if vl is None:
+                    return False
+                back = vl.quote_v3(r, quote, WETH, mid, sell_fee, from_addr)
             else:  # V2
                 back = v2_quote_out(r, sell_venue, quote, WETH, mid, q_dec=q_dec)
 
