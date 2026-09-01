@@ -47,8 +47,10 @@ class RPC:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             self.url, data=data, headers={"Content-Type": "application/json"})
-        with self._hard_open(req) as r:
-            body = r.read()
+        resp = self._hard_open(req)
+        if isinstance(resp, Exception):
+            raise resp
+        body = resp.read()
         obj = json.loads(body)
         if obj.get("error"):
             raise RuntimeError(obj["error"])

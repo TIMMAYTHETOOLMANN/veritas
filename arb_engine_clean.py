@@ -407,7 +407,7 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
 
         forward = quotes.get("forward", [])
         reverse = quotes.get("reverse", [])
-        if len(forward) < 1 or len(reverse) < 1:
+        if len(forward) < 2 or len(reverse) < 2:
             continue
 
         for fb in forward:
