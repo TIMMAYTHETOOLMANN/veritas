@@ -1,9 +1,0 @@
-{
-  "dependencies": {
-    "circomlib": "^2.0.5",
-    "circomlibjs": "^0.1.7"
-  },
-  "devDependencies": {
-    "circom": "^0.5.46"
-  }
-}
