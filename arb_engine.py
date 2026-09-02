@@ -34,7 +34,7 @@ from zk_prover import ZKProver
 
 # ---- Configuration ----
 SCAN_INTERVAL_SECONDS = 180
-MIN_SAFETY_MARGIN_USD = 0.005
+MIN_SAFETY_MARGIN_USD = 0.005   # conservative bootstrap: admit micro edges after gas
 AAVE_FLASH_FEE = 0.0005
 GAS_UNITS = 350_000
 FORK_URL = "http://127.0.0.1:8545"
@@ -377,7 +377,7 @@ def build_edge(pool_buy: Dict[str, Any], pool_sell: Dict[str, Any], quote_token:
     }
 
 
-def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int = 12, max_venues_per_quote: int = 8, use_multi_hop: bool = True, use_parallel: bool = True) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int = 12, max_venues_per_quote: int = 8, use_multi_hop: bool = True, use_parallel: bool = True, target_trade_usd: float = 0.0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not TOKENS:
         discover_tokens_and_pairs(rpc)
 
@@ -387,9 +387,12 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
     tokens = tokens[:max_venues_per_quote]
 
     factories = [SUSHI_FACTORY, UNIV2_FACTORY]
-    min_size = 10 ** 18
-    max_size = 10 ** 18
-    sizes = [min_size]
+    if target_trade_usd > 0 and eth_usd > 0:
+        size_wei = int((target_trade_usd / eth_usd) * 1e18)
+        size_wei = max(size_wei, 10 ** 17)
+    else:
+        size_wei = 10 ** 18
+    sizes = [size_wei]
 
     edges: List[Dict[str, Any]] = []
     report: List[Dict[str, Any]] = []

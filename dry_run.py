@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""VERITAS dry run: scan live fork, report all candidates, show what would execute."""
+"""VERITAS dry run: scan live fork, report candidates, show conservative sizing."""
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.rpc import RPC
+from core.capital_controller import CapitalController
 import arb_engine
 
 FORK_URL = "http://127.0.0.1:8545"
@@ -16,14 +17,50 @@ arb_engine.discover_tokens_and_pairs(rpc)
 print("tokens=", len(arb_engine.TOKENS))
 print("pair_cache=", len(arb_engine.PAIR_CACHE))
 
-# Scan with verbose reporting
-edges, report = arb_engine.scan_cross_venue(rpc, 2500.0, 0.875, size_steps=12, max_venues_per_quote=8)
+gas_wei = rpc.eth_gasPrice()
+gas_usd = (gas_wei * 450_000 / 1e18) * 2500.0
+controller = CapitalController()
+sized = controller.size_for_edge({}, gas_usd, 2500.0)
+target_trade_usd = sized.get("target_trade_usd", 0.0)
+print("capital_summary=", controller.summary())
+print("gas_usd=", round(gas_usd, 6))
+print("target_trade_usd=", round(target_trade_usd, 6))
+
+edges, report = arb_engine.scan_cross_venue(
+    rpc,
+    2500.0,
+    gas_usd,
+    size_steps=12,
+    max_venues_per_quote=8,
+    target_trade_usd=target_trade_usd,
+)
 print("cross_venue_edges=", len(edges))
 print("report_top=", report[:5])
 
-# Show all candidates with their profitability breakdown
 print("\n=== CANDIDATE EDGES ===")
 for i, edge in enumerate(edges[:20]):
+    gross = edge.get("gross_profit", 0.0)
+    cost = edge.get("total_cost", 0.0)
+    net = edge.get("net_margin", 0.0)
+    threshold = arb_engine.MIN_SAFETY_MARGIN_USD
+    gap = threshold - net if net < threshold else 0.0
+
+    print(f"edge_{i}: {edge.get('pool_buy')} -> {edge.get('pool_sell')}")
+    print(f"  size_weth={edge.get('size_weth')}")
+    print(f"  gross_profit=${gross:.6f}")
+    print(f"  total_cost=${cost:.6f}")
+    print(f"  net_margin=${net:.6f}")
+    print(f"  threshold=${threshold:.6f}")
+    print(f"  gap=${gap:.6f}")
+    print(f"  would_execute={net >= threshold}")
+
+    if net < threshold and gross > 0:
+        required_gross = cost + threshold
+        print(f"  required_gross_to_execute=${required_gross:.6f}")
+        print(f"  gross_shortfall=${required_gross - gross:.6f}")
+    print()
+
+# Best edge analysis
     gross = edge.get("gross_profit", 0.0)
     cost = edge.get("total_cost", 0.0)
     net = edge.get("net_margin", 0.0)

@@ -74,8 +74,8 @@ SCAN_RPCS = [
 
 SCAN_INTERVAL_SEC = 15       # TARGET cadence: one full hunt cycle every 15s (60 blocks)
 HEARTBEAT_EVERY_SEC = 15 * 60
-GAS_MULTIPLIER = 1.0         # profit must exceed 1.0x gas (break-even+)
-MIN_PROFIT_USD = 0.10        # net profit floor after gas; filter dust, catch small edges
+GAS_MULTIPLIER = 2.0         # conservative profit gate: require >2x estimated gas
+MIN_PROFIT_USD = 0.05        # micro-trade floor for small-capital bootstrap
 REFILL_GAS_THRESHOLD_ETH = 0.005   # top up if hot wallet ETH < 0.005 (~$1.25)
 REFILL_GAS_TARGET_ETH = 0.01       # withdraw/swap to reach ~0.01 ETH (~$2.5)
 SIM_BUDGET_PER_CYCLE = 6     # max fork-sims per cycle (best-net first). Fork
@@ -88,6 +88,14 @@ def log_event(evt):
     evt["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(evt) + "\n")
+
+
+def log_capital_state(controller, extra=None):
+    """Persist capital controller state to flash_hunter.log."""
+    payload = {"event": "capital_state", **controller.summary()}
+    if extra:
+        payload.update(extra)
+    log_event(payload)
 
 
 def load_key():
@@ -184,10 +192,12 @@ def _eth_usd_from_v2(rpc):
 
 
 def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
-    """One hunt cycle: registry cross-venue scan -> ZK-proof gate -> broadcast.
-    Returns a cycle summary dict.
-    """
+    """One hunt cycle: registry cross-venue scan -> size -> gate -> broadcast."""
     cycle_start = time.time()
+    # Capital controller for conservative micro-capital deployment.
+    from core.capital_controller import CapitalController
+    controller = CapitalController()
+    sim_summary = {"attempts": 0, "passes": 0, "best_net_usd": None}
     # Prefer local fork for scanning if available; fall back to public
     # scan endpoints so read traffic does not depend on the broadcast fleet.
     from core.rpc import RPC as Vrpc
@@ -219,12 +229,15 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
         eth_usd = out / 1e6 if out else 2450.0
     gas_wei = uint_or_zero(r.eth_gasPrice())
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
+    sized_edge_hint = controller.size_for_edge({}, gas_usd, eth_usd)
+    target_trade_usd = sized_edge_hint.get("target_trade_usd", 0.0)
     try:
         edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
                                                     size_steps=12,
                                                     max_venues_per_quote=8,
                                                     use_multi_hop=True,
-                                                    use_parallel=True)
+                                                    use_parallel=True,
+                                                    target_trade_usd=target_trade_usd)
     except Exception as e:
         import traceback
         print(f"[hunter] registry scan failed: {e}", flush=True)
@@ -236,34 +249,48 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
               f"{len(edges)} edges (ETH ${eth_usd:.0f})", flush=True)
 
     if not edges:
-        return {"edges": 0, "report": report, "passes": 0}
+        log_capital_state(controller, extra={"phase": "no_edges", "edges": 0, "passes": 0})
+        return {"edges": 0, "report": report, "passes": 0, "capital": controller.summary()}
 
     # ZK-PROOF PATH (ShadowPath Verkle+Groth16) - replaces fork-sim
-    zk_executor_addr = load_zk_executor()
-    zk_edges = [e for e in edges
-                if e.get("buy_kind") == 0 and e.get("sell_kind") == 0
-                and e.get("net_usd", 0) >= 2.0]
-    if ZK_AVAILABLE and zk_executor_addr and zk_edges:
-        print(f"[hunter] ZK gate: {len(zk_edges)} high-value V2 edges", flush=True)
-        receipt = execute_zk_edges(rpc, acct, zk_executor_addr, zk_edges, eth_usd, gas_usd)
-        passes = 1 if receipt and receipt.get("broadcast") == "ok" else 0
-    else:
-        passes = 0
-        receipt = None
+        zk_executor_addr = load_zk_executor()
+        # NOTE: edges carry `net_margin` (USD), not `net_usd`. The prior filter
+        # keyed on `ne_usd` and defaulted to 0, silently rejecting every edge and
+        # making the ZK path dead code. Gate on net_margin, aligned with the new
+        # MIN_PROFIT_USD floor so sub-floor trades never pay for a proof.
+        zk_edges = [e for e in edges
+                    if e.get("buy_kind") == 0 and e.get("sell_kind") == 0
+                    and float(e.get("net_margin", 0.0) or 0.0) >= MIN_PROFIT_USD]
+        log_event({"event": "zk_scan", "edges": len(edges), "zk_edges": len(zk_edges), "zk_executor": bool(zk_executor_addr)})
+        if ZK_AVAILABLE and zk_executor_addr and zk_edges:
+            print(f"[hunter] ZK gate: {len(zk_edges)} high-value V2 edges", flush=True)
+            receipt = execute_zk_edges(rpc, acct, zk_executor_addr, zk_edges, eth_usd, gas_usd)
+            passes = 1 if receipt and receipt.get("broadcast") == "ok" else 0
+        else:
+            passes = 0
+            receipt = None
 
     if not passes:
         # Existing fork-sim path is the authoritative fallback for every
         # non-V2 edge and every ZK failure. No opportunity is dropped.
         sim_results = simulate_edges_batch(edges, acct, executor_addr)
         for edge, sim in sim_results:
+            controller.record_attempt(gas_usd)
             log_event({"event": "sim", "edge": edge, "sim": sim})
+            sim_summary["attempts"] += 1
             if sim and sim.get("gate") == "PASS":
                 passes += 1
+                net = float(edge.get("net_margin", 0.0) or 0.0)
+                controller.record_result(net, gas_usd)
+                sim_summary["passes"] += 1
+                sim_summary["best_net_usd"] = net if sim_summary["best_net_usd"] is None else max(sim_summary["best_net_usd"], net)
+                log_capital_state(controller, extra={"phase": "sim_pass", "edge": edge})
 
+    log_capital_state(controller, extra={"phase": "cycle_end", "edges": len(edges), "passes": passes})
     log_event({"event": "cycle", "edges": len(edges), "passes": passes,
                "duration_sec": time.time() - cycle_start, "executor": executor_addr})
     return {"edges": len(edges), "passes": passes, "report": report,
-            "executor": executor_addr, "receipt": receipt}
+            "executor": executor_addr, "receipt": receipt, "capital": controller.summary()}
 
 
 def uint_or_zero(x):
