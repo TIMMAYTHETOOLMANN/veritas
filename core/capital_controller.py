@@ -22,7 +22,7 @@ INITIAL_DEPLOYABLE_USD: float = 10.00   # initial simulated deployable capital
 MIN_SIZE_USD: float = 0.05              # floor trade size in USD
 MAX_SIZE_USD: float = 1.00              # ceiling trade size in USD
 SIZE_CAP_FRACTION: float = 0.10         # never size more than 10% of deployable capital
-GAS_MULTIPLIER: float = 2.0             # require profit > 2x estimated gas
+GAS_MULTIPLIER: float = 1.0             # aligned with sim_gate.py/flash_hunter.py
 MIN_PROFIT_FLOOR_USD: float = 0.05      # minimum acceptable net profit after gas
 MAX_SIMS_PER_CYCLE: int = 6             # sim budget per scan cycle
 

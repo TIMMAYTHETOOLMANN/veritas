@@ -50,8 +50,8 @@ FORK_RPCS = [
     "https://arbitrum.publicnode.com",
 ]
 
-GAS_MULTIPLIER = 1.5     # aligned with flash_hunter.py — require 50% margin over gas
-MIN_PROFIT_USD = 5.00    # aligned with flash_hunter.py — sub-$5 trades leak alpha
+GAS_MULTIPLIER = 1.0     # aligned with flash_hunter.py — micro-capital bootstrap
+MIN_PROFIT_USD = 0.05    # aligned with flash_hunter.py — micro-trade floor
 
 
 # ---- anvil lifecycle (proven sim_trade.py pattern) -----------------------
