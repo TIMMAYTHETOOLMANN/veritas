@@ -65,6 +65,7 @@ SECRET_FILE = os.path.join(HERE, ".hot_secret")
 
 BROADCAST_RPCS = [
     "https://gateway.tenderly.co/public/arbitrum",
+    "https://arbitrum.publicnode.com",
 ]
 
 SCAN_RPCS = [
@@ -74,14 +75,14 @@ SCAN_RPCS = [
 
 SCAN_INTERVAL_SEC = 15       # TARGET cadence: one full hunt cycle every 15s (60 blocks)
 HEARTBEAT_EVERY_SEC = 15 * 60
-GAS_MULTIPLIER = 2.0         # conservative profit gate: require >2x estimated gas
+GAS_MULTIPLIER = 1.0         # aligned with sim_gate.py — micro-capital bootstrap
 MIN_PROFIT_USD = 0.05        # micro-trade floor for small-capital bootstrap
 REFILL_GAS_THRESHOLD_ETH = 0.005   # top up if hot wallet ETH < 0.005 (~$1.25)
 REFILL_GAS_TARGET_ETH = 0.01       # withdraw/swap to reach ~0.01 ETH (~$2.5)
-SIM_BUDGET_PER_CYCLE = 6     # max fork-sims per cycle (best-net first). Fork
+SIM_BUDGET_PER_CYCLE = 12    # max fork-sims per cycle (best-net first). Fork
                              # startup is the expensive part; marginal sims on
-                             # the same fork are ~1-2s each, so vetting 6 instead
-                             # of 4 raises the chance of a PASS per cycle.
+                             # the same fork are ~1-2s each, so vetting 12 instead
+                             # of 6 raises the chance of a PASS per cycle.
 
 
 def log_event(evt):
