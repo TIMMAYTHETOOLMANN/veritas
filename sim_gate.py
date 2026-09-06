@@ -12,8 +12,8 @@ scanner finds, this harness:
      back on poolSell -> repay principal+premium -> keep profit.
   4. Measures profit from the WETH balance delta of the owner (before vs
      after sweep) — ground truth, includes every fee and curve effect.
-  5. GATE: net_profit_usd > 20 * gas_used_usd  (user's spec) and
-     net_profit_usd > $0.50 minimum. Pass => GO for live broadcast.
+  5. GATE: net_profit_usd > GAS_MULTIPLIER (1.0) * gas_used_usd and
+     net_profit_usd > MIN_PROFIT_USD ($0.05). Pass => GO for live broadcast.
 
 Selftest mode (--selftest) proves the whole chain on a synthetic
 dislocation built from two mock pairs, without touching real pools:

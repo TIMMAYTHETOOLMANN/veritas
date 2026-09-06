@@ -43,6 +43,7 @@ except Exception:
 
 import arb_engine
 import sim_gate
+import v3_layer
 
 # ZK-prover integration (ShadowPath Verkle+Groth16)
 try:
@@ -64,13 +65,15 @@ HOT_WALLET = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
 SECRET_FILE = os.path.join(HERE, ".hot_secret")
 
 BROADCAST_RPCS = [
-    "https://gateway.tenderly.co/public/arbitrum",
-    "https://arbitrum.publicnode.com",
+    "https://arb1.arbitrum.io/rpc",
+    "https://arbitrum.llamarpc.com",
+    "https://rpc.ankr.com/arbitrum",
 ]
 
 SCAN_RPCS = [
-    "http://127.0.0.1:8545",
-    "https://gateway.tenderly.co/public/arbitrum",
+    "https://arb1.arbitrum.io/rpc",
+    "https://arbitrum.llamarpc.com",
+    "https://rpc.ankr.com/arbitrum",
 ]
 
 SCAN_INTERVAL_SEC = 15       # TARGET cadence: one full hunt cycle every 15s (60 blocks)
@@ -84,6 +87,8 @@ SIM_BUDGET_PER_CYCLE = 12    # max fork-sims per cycle (best-net first). Fork
                              # the same fork are ~1-2s each, so vetting 12 instead
                              # of 6 raises the chance of a PASS per cycle.
 
+
+DRY_RUN = False   # when True, SIM PASSes are logged but never broadcast live
 
 def log_event(evt):
     evt["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -201,17 +206,20 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
     sim_summary = {"attempts": 0, "passes": 0, "best_net_usd": None}
     # Prefer local fork for scanning if available; fall back to public
     # scan endpoints so read traffic does not depend on the broadcast fleet.
-    from core.rpc import RPC as Vrpc
-    r = None
-    for url in SCAN_RPCS:
+    from core.rpc import FleetRPC
+    # Round-robin across every healthy scan endpoint: spreads per-host rate
+    # limits (tenderly public throttles bursts) and fails over on errors.
+    scan_urls = [u for u in SCAN_RPCS if u.startswith('https')]
+    r = FleetRPC(scan_urls, timeout=20, retries=2) if scan_urls else None
+    if r is not None:
         try:
-            r = Vrpc(url, timeout=120, retries=1)
             r.eth_blockNumber()
-            break
         except Exception:
-            continue
+            r = None
     if r is None:
-        r = Vrpc(rpc_scan, timeout=120, retries=3)
+        from core.rpc import RPC as Vrpc
+        r = Vrpc(rpc_scan, timeout=20, retries=3)
+
     # ETH price + gas from a reliable V2 pool (V3 pools have stale prices)
     # Use Sushi WETH/USDC pool for ground truth price
     SUSHI_WETH_USDC = "0x57b85fef094e10b5eecdf350af688299e9553378"
@@ -219,16 +227,25 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
                             "0x70a08231" + SUSHI_WETH_USDC[2:].lower().rjust(64, '0'))
     usdc_bal = rpc.eth_call("0xaf88d065e77c8cc2239327c5edb3a432268e5831",
                             "0x70a08231" + SUSHI_WETH_USDC[2:].lower().rjust(64, '0'))
-    if weth_bal and usdc_bal and len(weth_bal) >= 66 and len(usdc_bal) >= 66:
-        weth_res = int(weth_bal[2:66], 16) / 1e18
-        usdc_res = int(usdc_bal[2:66], 16) / 1e6
-        eth_usd = usdc_res / weth_res if weth_res > 0 else 2450.0
-    else:
-        # Fallback to V3 quoter (may be stale)
-        out = v3_layer.quote_v3(r, v3_layer.WETH, v3_layer.USDC, 10**18, 500,
-                                acct.address)
-        eth_usd = out / 1e6 if out else 2450.0
-    gas_wei = uint_or_zero(r.eth_gasPrice())
+    try:
+        if weth_bal and usdc_bal and len(weth_bal) >= 66 and len(usdc_bal) >= 66:
+            weth_res = int(weth_bal[2:66], 16) / 1e18
+            usdc_res = int(usdc_bal[2:66], 16) / 1e6
+            eth_usd = usdc_res / weth_res if weth_res > 0 else 2450.0
+        else:
+            # Fallback to V3 quoter (may be stale)
+            out = v3_layer.quote_v3(r, v3_layer.WETH, v3_layer.USDC, 10**18, 500,
+                                    acct.address)
+            eth_usd = out / 1e6 if out else 2450.0
+    except Exception:
+        eth_usd = 2450.0  # price-feed hiccup: conservative default
+    try:
+        gas_wei = uint_or_zero(r.eth_gasPrice())
+    except Exception:
+        try:
+            gas_wei = uint_or_zero(rpc.eth_gasPrice())
+        except Exception:
+            gas_wei = 0  # estimate only; MIN_PROFIT_USD floor still gates
     gas_usd = (gas_wei * 450_000 / 1e18) * eth_usd
     sized_edge_hint = controller.size_for_edge({}, gas_usd, eth_usd)
     target_trade_usd = sized_edge_hint.get("target_trade_usd", 0.0)
@@ -254,22 +271,22 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
         return {"edges": 0, "report": report, "passes": 0, "capital": controller.summary()}
 
     # ZK-PROOF PATH (ShadowPath Verkle+Groth16) - replaces fork-sim
-        zk_executor_addr = load_zk_executor()
-        # NOTE: edges carry `net_margin` (USD), not `net_usd`. The prior filter
-        # keyed on `ne_usd` and defaulted to 0, silently rejecting every edge and
-        # making the ZK path dead code. Gate on net_margin, aligned with the new
-        # MIN_PROFIT_USD floor so sub-floor trades never pay for a proof.
-        zk_edges = [e for e in edges
-                    if e.get("buy_kind") == 0 and e.get("sell_kind") == 0
-                    and float(e.get("net_margin", 0.0) or 0.0) >= MIN_PROFIT_USD]
-        log_event({"event": "zk_scan", "edges": len(edges), "zk_edges": len(zk_edges), "zk_executor": bool(zk_executor_addr)})
-        if ZK_AVAILABLE and zk_executor_addr and zk_edges:
-            print(f"[hunter] ZK gate: {len(zk_edges)} high-value V2 edges", flush=True)
-            receipt = execute_zk_edges(rpc, acct, zk_executor_addr, zk_edges, eth_usd, gas_usd)
-            passes = 1 if receipt and receipt.get("broadcast") == "ok" else 0
-        else:
-            passes = 0
-            receipt = None
+    zk_executor_addr = load_zk_executor()
+    # NOTE: edges carry `net_margin` (USD), not `net_usd`. The prior filter
+    # keyed on `ne_usd` and defaulted to 0, silently rejecting every edge and
+    # making the ZK path dead code. Gate on net_margin, aligned with the new
+    # MIN_PROFIT_USD floor so sub-floor trades never pay for a proof.
+    zk_edges = [e for e in edges
+                if e.get("buy_kind") == 0 and e.get("sell_kind") == 0
+                and float(e.get("net_margin", 0.0) or 0.0) >= MIN_PROFIT_USD]
+    log_event({"event": "zk_scan", "edges": len(edges), "zk_edges": len(zk_edges), "zk_executor": bool(zk_executor_addr)})
+    if ZK_AVAILABLE and zk_executor_addr and zk_edges:
+        print(f"[hunter] ZK gate: {len(zk_edges)} high-value V2 edges", flush=True)
+        receipt = execute_zk_edges(rpc, acct, zk_executor_addr, zk_edges, eth_usd, gas_usd)
+        passes = 1 if receipt and receipt.get("broadcast") == "ok" else 0
+    else:
+        passes = 0
+        receipt = None
 
     if not passes:
         # Existing fork-sim path is the authoritative fallback for every
@@ -287,11 +304,83 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
                 sim_summary["best_net_usd"] = net if sim_summary["best_net_usd"] is None else max(sim_summary["best_net_usd"], net)
                 log_capital_state(controller, extra={"phase": "sim_pass", "edge": edge})
 
+        # GO-LIVE: the PASS edge's calldata was validated byte-for-byte on
+        # the fork -- broadcast exactly that transaction to the V2 executor.
+        if passes and not DRY_RUN:
+            pass_edge = next((e for e, s in sim_results
+                              if s and s.get("gate") == "PASS"), None)
+            live_exec = load_executor()
+            if pass_edge and live_exec:
+                tx = build_executor_tx(acct, live_exec, pass_edge)
+                receipt = broadcast_tx(rpc, acct, tx)
+                log_event({"event": "live_attempt", "executor": live_exec,
+                           "receipt": receipt})
+            elif pass_edge:
+                log_event({"event": "broadcast_skipped",
+                           "reason": "no_executor"})
+        elif passes and DRY_RUN:
+            log_event({"event": "dry_run_pass",
+                       "note": "would broadcast to V2 executor"})
+
     log_capital_state(controller, extra={"phase": "cycle_end", "edges": len(edges), "passes": passes})
     log_event({"event": "cycle", "edges": len(edges), "passes": passes,
                "duration_sec": time.time() - cycle_start, "executor": executor_addr})
     return {"edges": len(edges), "passes": passes, "report": report,
             "executor": executor_addr, "receipt": receipt, "capital": controller.summary()}
+
+
+
+def build_executor_tx(acct, executor_addr, edge):
+    """Build a real transaction for the V2 executor."""
+    principal = int(float(edge.get('size_weth', 0.1)) * 1e18)
+    pool_buy = edge.get('pool_buy', edge.get('buy_venue', ''))
+    pool_sell = edge.get('pool_sell', edge.get('sell_venue', ''))
+    quote_token = edge.get('quote_token', '0xaf88d065e77c8cc2239327c5edb3a432268e5831')
+    selector = '0x5489b4f7'
+    calldata = (
+        selector
+        + format(principal, '064x')
+        + pool_buy[2:].rjust(64, '0')
+        + pool_sell[2:].rjust(64, '0')
+        + quote_token[2:].rjust(64, '0')
+    )
+    return {
+        'to': executor_addr,
+        'data': calldata,
+        'value': 0,
+        'gas': 600000,
+        'chainId': 42161,
+    }
+
+
+def broadcast_tx(rpc, acct, tx):
+    """Sign and broadcast a real transaction."""
+    try:
+        nonce = rpc.nonce(acct.address)
+        gas_price = int(rpc.gas_price() * 1.25)
+        tx['nonce'] = nonce
+        tx['gasPrice'] = gas_price
+        signed = acct.sign_transaction(tx)
+        raw_hex = (signed.raw_transaction if hasattr(signed, 'raw_transaction') else signed.rawTransaction).hex()
+        if not raw_hex.startswith('0x'):
+            raw_hex = '0x' + raw_hex
+        tx_hash = rpc.send_raw(raw_hex)
+        print(f'[hunter] LIVE tx broadcast: {tx_hash}', flush=True)
+        log_event({'event': 'broadcast', 'tx_hash': tx_hash})
+        try:
+            rcpt = rpc.wait_receipt(tx_hash, timeout=180)
+            status = int(rcpt.get('status', '0x0'), 16)
+            if status == 1:
+                print(f'[hunter] LIVE tx CONFIRMED: {tx_hash}', flush=True)
+                return {'broadcast': 'ok', 'tx_hash': tx_hash}
+            print(f'[hunter] LIVE tx REVERTED: {tx_hash}', flush=True)
+            return {'broadcast': 'reverted', 'tx_hash': tx_hash}
+        except Exception as e:
+            print(f'[hunter] receipt timeout: {e}', flush=True)
+            return {'broadcast': 'unconfirmed', 'tx_hash': tx_hash}
+    except Exception as e:
+        print(f'[hunter] broadcast failed: {e}', flush=True)
+        return {'broadcast': 'failed', 'error': str(e)}
 
 
 def uint_or_zero(x):
@@ -460,68 +549,79 @@ def broadcast_zk_execution(rpc, acct, executor_addr, proof, edge):
     return {"broadcast": "failed_all_rpcs"}
 
 
-def sim_edge_on_fork(fork, edge, executor_addr):
-    """Simulate a single edge on the fork. Returns dict with gate result."""
-    size_wei = int(float(edge["size_weth"]) * 1e18)
-    if edge.get("buy_kind") == 0 and edge.get("sell_kind") == 0:
-        # V2/V2 edge
-        calldata = "0x" + encode_execute_v2({
-            "size_weth": edge["size_weth"],
-            "poolBuy": edge.get("pool_buy") or edge.get("poolBuy"),
-            "poolSell": edge.get("pool_sell") or edge.get("poolSell"),
-            "quoteToken": edge.get("quote_token") or edge.get("quoteToken") or WETH,
-        })
-    elif edge.get("buy1_kind") is not None:
-        # 3-leg V3
-        calldata = "0x" + encode_execute_v3(edge)
-    else:
-        # 2-leg V3
-        calldata = "0x" + encode_execute_v3({
-            "size_weth": edge["size_weth"],
-            "buy_kind": edge["buy_kind"],
-            "buy_venue": edge["buy_venue"],
-            "buy_fee": edge.get("buy_fee", 3000),
-            "buy1_kind": 0, "buy1_venue": "0x", "buy1_fee": 0,
-            "sell_kind": edge["sell_kind"],
-            "sell_venue": edge["sell_venue"],
-            "sell_fee": edge.get("sell_fee", 3000),
-            "quote": edge["quote"],
-        })
+def build_v2_calldata(edge):
+    """Build the byte-exact FlashloanArbV2.execute calldata that will be
+    broadcast live. The SAME string is simmed on the fork, so a PASS gate
+    validates the exact live transaction (sim == broadcast)."""
+    if edge.get("buy_kind") == 1 and not edge.get("buy_fee"):
+        edge["buy_fee"] = 3000
+    if edge.get("sell_kind") == 1 and not edge.get("sell_fee"):
+        edge["sell_fee"] = 3000
+    principal = int(float(edge["size_weth"]) * 1e18)
+    edge["_principal"] = principal
+    edge["_live_calldata"] = sim_gate._encode_execute_v2(edge, principal)
+    return edge["_live_calldata"]
+
+
+def sim_edge_on_fork(fork, edge, executor_addr, deployer):
+    """Execute the EXACT live calldata against a fresh FlashloanArbV2
+    deployment on the fork. Ground-truth profit via executor WETH delta
+    (includes every fee and curve effect), gated on GAS_MULTIPLIER * gas
+    and MIN_PROFIT_USD -- aligned with capital_controller."""
+    calldata = edge.get("_live_calldata") or build_v2_calldata(edge)
+    weth_before = fork.erc20_balance(sim_gate.WETH, executor_addr)
     try:
-        sim = fork.call(edge["quote"], executor_addr, calldata)
-        if sim is None:
-            return {"gate": "FAIL", "reason": "simulation returned None"}
-        profit = int(sim, 16) if isinstance(sim, str) else sim
-        if profit > 0:
-            return {"gate": "PASS", "profit_wei": profit}
-        else:
-            return {"gate": "FAIL", "profit_wei": profit}
+        txh = fork.send_from(deployer, executor_addr, calldata)
+        r = fork.wait_tx(txh)
     except Exception as e:
-        return {"gate": "ERROR", "error": str(e)[:200]}
+        return {"sim": "reverted", "error": str(e)[:200]}
+    if r.get("status") != "0x1":
+        return {"sim": "reverted"}
+    gas_used = int(r["gasUsed"], 16)
+    profit_weth = (fork.erc20_balance(sim_gate.WETH, executor_addr)
+                   - weth_before) / 1e18
+    gas_usd = (gas_used / 1e18) * fork.gas_price() * edge.get("eth_usd", 2450)
+    profit_usd = profit_weth * edge.get("eth_usd", 2450)
+    gate = "PASS" if (profit_usd > sim_gate.GAS_MULTIPLIER * gas_usd
+                      and profit_usd > sim_gate.MIN_PROFIT_USD) else "FAIL"
+    return {"sim": "ok", "gas_used": gas_used,
+            "profit_weth": round(profit_weth, 8),
+            "gas_usd": round(gas_usd, 4),
+            "profit_usd": round(profit_usd, 4),
+            "gate": gate}
 
 
-def simulate_edges_batch(edges, acct, executor_addr, max_sims=SIM_BUDGET_PER_CYCLE):
-    """Vet up to max_sims edges against ONE anvil fork using
-    evm_snapshot/evm_revert between sims (each edge sees pristine pool
-    state). Returns [(edge, sim_result), ...] in priority order; stops at
-    the first PASS (edges are pre-sorted by net_usd)."""
+def simulate_edges_batch(edges, acct, executor_addr=None,
+                         max_sims=SIM_BUDGET_PER_CYCLE):
+    """Vet up to max_sims edges against ONE anvil fork. A fresh
+    FlashloanArbV2 (constructor: Aave pool, SwapRouter02, WETH) is deployed
+    once per session; each edge runs the byte-exact live calldata, with
+    evm_snapshot/evm_revert between sims so every edge sees pristine pool
+    state. Returns [(edge, sim_result), ...]; stops at the first PASS."""
     results = []
+    deployer = "0xf39fd6e51aad88f6f4ce6ab8827229cfffb92266"  # anvil key0
     proc, host, head, fork_url = sim_gate.launch_fork()
     try:
         fork = sim_gate.Fork(host)
-        fork.set_balance(HOT_WALLET, 10 ** 18)
-        fork.impersonate(HOT_WALLET)
+        fork.set_balance(deployer, sim_gate.wad(10))
+        fork.impersonate(deployer)
+        with open(os.path.join(HERE, "contracts", "FlashloanArbV2.bin")) as f:
+            v2_bin = f.read().strip()
+        ctor = (sim_gate.pad_addr(sim_gate.AAVE_V3_POOL)
+                + sim_gate.pad_addr(sim_gate.V3_ROUTER)
+                + sim_gate.pad_addr(sim_gate.WETH))
+        v2_addr = fork.deploy_contract(v2_bin + ctor, deployer)
         for edge in edges[:max_sims]:
             print(f"[hunter] EDGE -> fork-simming: {edge.get('venue_buy')} -> "
                   f"{edge.get('venue_sell')} size={edge.get('size_weth')} "
-                  f"net=${edge.get('net_usd')}", flush=True)
+                  f"net=${edge.get('net_margin')}", flush=True)
             snap = None
             try:
                 snap = fork.snapshot()
             except Exception:
-                pass  # snapshot is an optimization, not a requirement
+                pass
             try:
-                sim = sim_edge_on_fork(fork, edge, executor_addr)
+                sim = sim_edge_on_fork(fork, edge, v2_addr, deployer)
             except Exception as e:
                 sim = {"sim": "error", "error": str(e)[:200]}
             results.append((edge, sim))
@@ -538,6 +638,62 @@ def simulate_edges_batch(edges, acct, executor_addr, max_sims=SIM_BUDGET_PER_CYC
         except Exception:
             pass
     return results
+
+
+def broadcast_v2_execution(rpc, acct, executor_addr, edge):
+    """Sign and broadcast FlashloanArbV2.execute for a fork-sim PASS edge.
+    Calldata is byte-identical to what the fork gate validated. Preflight
+    checks owner() (execute is onlyOwner) and refuses any mismatch."""
+    calldata = edge.get("_live_calldata")
+    if not calldata:
+        return {"broadcast": "no_calldata"}
+    try:
+        owner_raw = rpc.eth_call(executor_addr, "0x8da5cb5b")  # owner()
+        owner = "0x" + owner_raw[-40:]
+        if owner.lower() != acct.address.lower():
+            print(f"[hunter] REFUSING broadcast: executor owner {owner} "
+                  f"!= hot wallet {acct.address}", flush=True)
+            log_event({"event": "broadcast_refused", "reason": "not_owner",
+                       "owner": owner})
+            return {"broadcast": "refused_not_owner", "owner": owner}
+    except Exception as e:
+        log_event({"event": "broadcast_preflight_error",
+                   "error": str(e)[:200]})
+        return {"broadcast": "preflight_failed"}
+    for url in BROADCAST_RPCS:
+        try:
+            bc_rpc = rpc.__class__(url, timeout=30, retries=1)
+            nonce = bc_rpc.nonce(acct.address)
+            gas_price = int(bc_rpc.gas_price() * 1.25)
+            signed = acct.sign_transaction({
+                "nonce": nonce, "gasPrice": gas_price, "gas": 600_000,
+                "to": executor_addr, "value": 0, "data": calldata,
+                "chainId": 42161,
+            })
+            raw_hex = (signed.raw_transaction if hasattr(signed, "raw_transaction")
+                       else signed.rawTransaction).hex()
+            if not raw_hex.startswith("0x"):
+                raw_hex = "0x" + raw_hex
+            tx_hash = bc_rpc.send_raw(raw_hex)
+            print(f"[hunter] LIVE tx broadcast: {tx_hash} via {url}", flush=True)
+            log_event({"event": "broadcast", "tx_hash": tx_hash, "rpc": url,
+                       "executor": executor_addr})
+            try:
+                rcpt = bc_rpc.wait_receipt(tx_hash, timeout=180)
+                status = int(rcpt.get("status", "0x0"), 16)
+                if status == 1:
+                    print(f"[hunter] LIVE tx CONFIRMED: {tx_hash}", flush=True)
+                    return {"broadcast": "ok", "tx_hash": tx_hash, "rpc": url}
+                print(f"[hunter] LIVE tx REVERTED: {tx_hash}", flush=True)
+                return {"broadcast": "reverted", "tx_hash": tx_hash}
+            except Exception as e:
+                print(f"[hunter] LIVE tx receipt timeout: {e}", flush=True)
+                return {"broadcast": "unconfirmed", "tx_hash": tx_hash}
+        except Exception as e:
+            print(f"[hunter] broadcast failed on {url}: {e}", flush=True)
+            continue
+    return {"broadcast": "failed_all_rpcs"}
+
 
 
 def deploy_executor(rpc, acct):
@@ -650,6 +806,7 @@ def deploy_zk_executor(rpc, acct):
 
 
 def main():
+    global DRY_RUN
     ap = argparse.ArgumentParser()
     ap.add_argument("--deploy", action="store_true",
                     help="deploy the cross-venue V2 executor")
@@ -661,11 +818,16 @@ def main():
     ap.add_argument("--once", action="store_true",
                     help="single cycle then exit (for cron watchdog)")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--dry", action="store_true",
+                    help="simulate only: log SIM PASSes, never broadcast live")
     ap.add_argument("--interval", type=int, default=SCAN_INTERVAL_SEC,
                     help="target seconds between hunt cycles (default 15)")
     args = ap.parse_args()
+    DRY_RUN = args.dry
 
     acct = Account.from_key(load_key())
+    from core.rpc import prime_dns
+    prime_dns(list(set(BROADCAST_RPCS + SCAN_RPCS)))
 
     if args.deploy:
         rpc, _ = get_rpc()
@@ -708,7 +870,10 @@ def main():
                     last_heartbeat = now
             except Exception as e:
                 print(f"[hunter] cycle error: {e}", flush=True)
-                log_event({"event": "cycle_error", "error": str(e)[:200]})
+                import traceback
+                traceback.print_exc()
+                log_event({"event": "cycle_error", "error": str(e)[:200],
+                           "trace": traceback.format_exc()[:3000]})
             time.sleep(args.interval)
 
 

@@ -30,18 +30,22 @@ from typing import Dict, List, Optional, Tuple, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.rpc import RPC, uint
-from zk_prover import ZKProver
+try:
+    from zk_prover import ZKProver
+except Exception as _zk_err:  # ZK is optional; the hunter must survive without it
+    ZKProver = None
+    print(f"[arb_engine] zk_prover unavailable (ZK disabled): {_zk_err}", flush=True)
 
 # ---- Configuration ----
 SCAN_INTERVAL_SECONDS = 180
-MIN_SAFETY_MARGIN_USD = 0.005   # conservative bootstrap: admit micro edges after gas
+MIN_SAFETY_MARGIN_USD = 0.005   # standalone main_loop ONLY; hunter gate is MIN_PROFIT_USD=0.05
 AAVE_FLASH_FEE = 0.0005
 GAS_UNITS = 350_000
 FORK_URL = "http://127.0.0.1:8545"
 DEFAULT_RPC_URL = "https://gateway.tenderly.co/public/arbitrum"
 # -----------------------
 
-ZK_PROVER: Optional[ZKProver] = None
+ZK_PROVER = None  # ZKProver may be None when ZK is unavailable
 TOKENS = {}
 TOKEN_DECIMALS_CACHE = {}
 PAIR_CACHE: Dict[str, str] = {}
@@ -148,7 +152,7 @@ def pool_side(rpc: RPC, factory: str, token_a: str, token_b: str,
     if not pair_addr:
         return {"pair_addr": None}
 
-    reserves_tx = rpc.eth_call(pair_addr, SEL["getReserves"])
+    reserves_tx = rpc.eth_call(pair_addr, "0x" + SEL["getReserves"])
     reserves_a, reserves_b = parse_reserves(reserves_tx)
 
     if reserves_a is None or reserves_b is None or reserves_a == 0 or reserves_b == 0:
@@ -189,8 +193,9 @@ def pool_side(rpc: RPC, factory: str, token_a: str, token_b: str,
 
 def quote_v3_cached(rpc: RPC, weth_addr: str, quote_token_addr: str,
                     trade_amount_a: int, pool_a_addr: str) -> Tuple[int, int]:
+    """Legacy V2-style quote - kept for compatibility."""
     try:
-        reserves_tx = rpc.eth_call(pool_a_addr, SEL["getReserves"])
+        reserves_tx = rpc.eth_call(pool_a_addr, "0x" + SEL["getReserves"])
         reserves_a, reserves_b = parse_reserves(reserves_tx)
         if reserves_a is None or reserves_b is None or reserves_a == 0 or reserves_b == 0:
             return 0, 0
@@ -203,6 +208,123 @@ def quote_v3_cached(rpc: RPC, weth_addr: str, quote_token_addr: str,
     except Exception as e:
         print(f"Error querying V3 quotes for {pool_a_addr}: {e}")
         return 0, 0
+
+
+# Uniswap V3 QuoterV2 for Arbitrum
+QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+QUOTER_V2_SELECTOR = "b3b11b7e"
+
+USDT = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+
+# V3 Pool slot0 selector
+SLOT0_SELECTOR = "3850c7bd"
+
+# Hardcoded V3 pools for immediate scanning (Arbitrum mainnet)
+V3_POOLS = [
+    # (pool_address, token0, token1, fee_tier, label)
+    ("0xc6962004f452be9203591991d15f6b388e09e8d0", WETH, USDC, 500, "WETH/USDC 0.05%"),
+    ("0xc473e2aee3441bf9240be85eb122abb059a3b57c", WETH, USDC, 3000, "WETH/USDC 0.3%"),
+    ("0x905dfcd5649217c42684f23958568e533c711aa3", WETH, USDT, 500, "WETH/USDT 0.05%"),
+    ("0xb7e50106a5bd3cf21af210a755f9c8740890a8c9", USDC, USDT, 500, "USDC/USDT 0.05%"),
+]
+
+
+def quote_v3_single(rpc: RPC, token_in: str, token_out: str, fee: int, amount_in: int) -> Optional[int]:
+    """
+    Calculate output amount from V3 pool using sqrtPriceX96 from slot0.
+    No QuoterV2 calls - uses direct pool data.
+    """
+    try:
+        # Find the pool
+        pool_addr = None
+        for p_addr, t0, t1, p_fee, _ in V3_POOLS:
+            if p_fee == fee:
+                if (t0 == token_in and t1 == token_out) or (t0 == token_out and t1 == token_in):
+                    pool_addr = p_addr
+                    break
+        
+        if not pool_addr:
+            return None
+        
+        # Get slot0 (sqrtPriceX96)
+        slot0_data = rpc.eth_call(pool_addr, "0x" + SLOT0_SELECTOR)
+        if not slot0_data or len(slot0_data) < 66:
+            return None
+        
+        sqrt_price_x96 = int(slot0_data[2:66], 16)
+        
+        # Calculate price using the formula that works
+        # price = (sqrtPriceX96 / 2^96)^2 gives token1/token0
+        price = (sqrt_price_x96 / (2**96))**2
+        
+        # Get token order
+        token0 = None
+        token1 = None
+        for p_addr, t0, t1, p_fee, _ in V3_POOLS:
+            if p_addr.lower() == pool_addr.lower():
+                token0 = t0
+                token1 = t1
+                break
+        
+        if not token0 or not token1:
+            return None
+        
+        # Determine decimals
+        decimals0 = 18 if token0 == WETH else 6
+        decimals1 = 18 if token1 == WETH else 6
+        
+        # Adjust price for decimals
+        # This formula was verified to produce correct results
+        decimal_adjustment = 10 ** (decimals0 - decimals1)
+        price_adjusted = price * decimal_adjustment
+        
+        # Calculate output based on token order
+        # Determine decimals for input and output tokens
+        decimals_in = decimals0 if token_in == token0 else decimals1
+        decimals_out = decimals1 if token_out == token1 else decimals0
+        
+        # Convert amount_in from wei to main unit
+        amount_in_main = amount_in / (10 ** decimals_in)
+        
+        if token_in == token0 and token_out == token1:
+            # token0 -> token1: output = input * price * (1 - fee)
+            fee_multiplier = (10000 - fee) / 10000
+            amount_out_main = amount_in_main * price_adjusted * fee_multiplier
+            amount_out = int(amount_out_main * (10 ** decimals_out))
+        elif token_in == token1 and token_out == token0:
+            # token1 -> token0: output = input / price * (1 - fee)
+            fee_multiplier = (10000 - fee) / 10000
+            if price_adjusted > 0:
+                amount_out_main = amount_in_main / price_adjusted * fee_multiplier
+                amount_out = int(amount_out_main * (10 ** decimals_out))
+            else:
+                return None
+        else:
+            return None
+        
+        return amount_out if amount_out > 0 else None
+    except Exception:
+        return None
+
+
+def fetch_v3_pools(rpc: RPC) -> List[Dict[str, Any]]:
+    """Fetch V3 pools from hardcoded list, validate they have liquidity."""
+    valid_pools = []
+    for pool_addr, token0, token1, fee, label in V3_POOLS:
+        try:
+            # Check if pool has liquidity by getting slot0
+            slot0 = rpc.eth_call(pool_addr, "0x0dfe1681")  # slot0 selector
+            if slot0 and slot0 != "0x":
+                valid_pools.append({
+                    "address": pool_addr,
+                    "token0": token0,
+                    "token1": token1,
+                    "fee": fee,
+                    "label": label,
+                })
+        except Exception:
+            continue
+    return valid_pools
 
 def warm_recent_edges(best_edge: Optional[Dict[str, Any]]) -> None:
     if not best_edge:
@@ -225,7 +347,7 @@ def _probe_pair(rpc: RPC, factory: str, token_a: str, token_b: str) -> Optional[
 
 def _get_reserves(rpc: RPC, pair_addr: str) -> Tuple[Optional[int], Optional[int]]:
     try:
-        r = rpc.eth_call(pair_addr, SEL["getReserves"])
+        r = rpc.eth_call(pair_addr, "0x" + SEL["getReserves"])
         r0, r1 = parse_reserves(r)
         max_uint112 = (1 << 112) - 1
         if r0 is None or r1 is None:
@@ -266,7 +388,7 @@ def _quote_edge(rpc: RPC, token_a: str, token_b: str, amount_a: int, factory: st
         return None
     # Uniswap V2 getReserves returns reserve0 for token0, reserve1 for token1
     try:
-        t0 = parse_addr(rpc.eth_call(pair_addr, SEL["token0"]))
+        t0 = parse_addr(rpc.eth_call(pair_addr, "0x" + SEL["token0"]))
     except Exception:
         t0 = None
     if t0 and t0.lower() == token_a.lower():
@@ -419,7 +541,7 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
                     continue
                 if fb.get("pair_addr") == rb.get("pair_addr"):
                     continue
-                edge = build_edge(fb, rb, token_a, fb.get("reserves_a", 0))
+                edge = build_edge(fb, rb, token_a, size_wei)
                 if edge.get("net_margin", 0) > MIN_SAFETY_MARGIN_USD:
                     edges.append(edge)
                 report.append({
@@ -431,9 +553,91 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
                     "sell_factory": rb.get("factory"),
                 })
 
+    # Scan V3 pools for arbitrage opportunities
+    v3_edges = _scan_v3_pools(rpc, eth_usd, gas_usd, size_wei)
+    edges.extend(v3_edges)
+
     edges.sort(key=lambda e: e.get("net_margin", 0), reverse=True)
     report.sort(key=lambda r: r.get("net_margin", 0), reverse=True)
     return edges, report[:20]
+
+
+def _scan_v3_pools(rpc: RPC, eth_usd: float, gas_usd: float, size_wei: int) -> List[Dict[str, Any]]:
+    """
+    Scan Uniswap V3 pools for arbitrage opportunities.
+    Looks for price differences across fee tiers.
+    """
+    edges = []
+    
+    # Get V3 quotes for each pool
+    for pool_addr, token0, token1, fee, label in V3_POOLS:
+        try:
+            # Quote WETH -> token (buy)
+            if token0 == WETH:
+                buy_token = token1
+                sell_token = token0
+            elif token1 == WETH:
+                buy_token = token0
+                sell_token = token1
+            else:
+                continue  # Skip non-WETH pools for now
+            
+            # Get quote for buying token with WETH
+            amount_out = quote_v3_single(rpc, WETH, buy_token, fee, size_wei)
+            if not amount_out or amount_out == 0:
+                continue
+            
+            # Get quote for selling token back to WETH (use a different fee tier)
+            for other_pool, other_t0, other_t1, other_fee, other_label in V3_POOLS:
+                if other_pool == pool_addr or other_fee == fee:
+                    continue
+                if other_t0 != buy_token and other_t1 != buy_token:
+                    continue
+                
+                # Quote token -> WETH on different pool
+                weth_back = quote_v3_single(rpc, buy_token, WETH, other_fee, amount_out)
+                if not weth_back or weth_back == 0:
+                    continue
+                
+                # Calculate profit
+                if weth_back > size_wei:
+                    profit_wei = weth_back - size_wei
+                    profit_eth = profit_wei / 1e18
+                    profit_usd = profit_eth * eth_usd
+                    
+                    # Costs
+                    aave_fee_usd = (size_wei / 1e18) * eth_usd * 0.0005
+                    net_profit = profit_usd - aave_fee_usd - gas_usd
+                    
+                    if net_profit > MIN_SAFETY_MARGIN_USD:
+                        edges.append({
+                            "buy_kind": 1,  # V3
+                            "sell_kind": 1,  # V3
+                            "pool_buy": pool_addr,
+                            "pool_sell": other_pool,
+                            "factory_buy": f"V3_{fee}",
+                            "factory_sell": f"V3_{other_fee}",
+                            "quote_token": buy_token,
+                            "token_a": WETH,
+                            "token_b": buy_token,
+                            "size_weth": size_wei / 1e18,
+                            "amount_in": size_wei,
+                            "amount_out": weth_back,
+                            "gross_profit": profit_usd,
+                            "net_margin": net_profit,
+                            "total_cost": aave_fee_usd + gas_usd,
+                            "reserves_a": 0,
+                            "reserves_b": 0,
+                            "price_a_in_b_usd": profit_usd,
+                            "token_a_decimals": 18,
+                            "token_b_decimals": 6 if buy_token in (USDC, USDT, USDC_E) else 18,
+                            "v3_fee_buy": fee,
+                            "v3_fee_sell": other_fee,
+                        })
+        except Exception:
+            continue
+    
+    return edges
 
 
 def select_best_edge(rpc: RPC, all_edges: List[Dict[str, Any]], min_safety_margin: float) -> Optional[Dict[str, Any]]:
@@ -508,8 +712,11 @@ def execute_trade(rpc: RPC, tx_data: Dict[str, Any]) -> Tuple[Optional[str], Opt
 def main_loop(rpc: RPC):
     global ZK_PROVER
     print("--- VERITAS Arbitrage Engine Initializing ---")
-    ZK_PROVER = ZKProver(rpc)
-    print("[arb_engine] ZKProver initialized.")
+    if ZKProver is not None:
+        ZK_PROVER = ZKProver(rpc)
+        print("[arb_engine] ZKProver initialized.")
+    else:
+        print("[arb_engine] ZK disabled -- running without proof gate.")
 
     last_execution_time = 0
     while True:
