@@ -44,8 +44,6 @@ interface IPair {
 }
 
 contract ZKArbExecutor is Groth16Verifier {
-    using IERC20 for IERC20;
-    
     address public immutable AAVE_POOL;
     address public immutable V3_ROUTER;
     address public immutable WETH;
@@ -96,14 +94,13 @@ contract ZKArbExecutor is Groth16Verifier {
         uint256[2] calldata a,
         uint256[2][2] calldata b,
         uint256[2] calldata c,
-        uint256[] calldata publicSignals,
+        uint256[3] calldata publicSignals,
         bytes calldata arbCalldata
     ) external payable returns (uint256 profitWeth) {
         // 1. Verify Groth16 proof (inherited from Groth16Verifier)
         require(verifyProof(a, b, c, publicSignals), "ZK: invalid proof");
         
         // 2. Extract and validate public signals (3 total: nullifier, profit, net)
-        require(publicSignals.length == 3, "ZK: invalid public signals length");
         bytes32 nullifier = bytes32(publicSignals[0]);
         
         // 3. Replay protection: nullifier must not have been used
@@ -191,7 +188,7 @@ contract ZKArbExecutor is Groth16Verifier {
             
             IERC20(WETH).transfer(buyLeg.venue, amount);
             (uint256 out0, uint256 out1) = IPair(buyLeg.venue).token0() == quoteToken
-                ? (quoteOut, 0) : (0, quoteOut);
+                ? (quoteOut, uint256(0)) : (uint256(0), quoteOut);
             IPair(buyLeg.venue).swap(out0, out1, address(this), "");
         } else {
             // V3 pool via router
@@ -221,7 +218,7 @@ contract ZKArbExecutor is Groth16Verifier {
             
             IERC20(quoteToken).transfer(sellLeg.venue, quoteBal);
             (uint256 sout0, uint256 sout1) = IPair(sellLeg.venue).token0() == WETH
-                ? (wethOut, 0) : (0, wethOut);
+                ? (wethOut, uint256(0)) : (uint256(0), wethOut);
             IPair(sellLeg.venue).swap(sout0, sout1, address(this), "");
         } else {
             // V3 pool via router
