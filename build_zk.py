@@ -35,15 +35,16 @@ VERIFIER_SOL = HERE / "contracts" / "Groth16Verifier.sol"
 
 
 def find_circomlib():
-    """Find circomlib installation path."""
+    """Find circomlib installation path (dir containing circuits/ for circom -l)."""
     common_paths = [
+        HERE / "zk_circuits" / "circomlib",
         Path("/usr/local/lib/node_modules/circomlib"),
         Path("/usr/lib/node_modules/circomlib"),
         Path.home() / ".npm-global" / "lib" / "node_modules" / "circomlib",
         Path(os.environ.get("NODE_PATH", "")) / "circomlib",
     ]
     for p in common_paths:
-        if p.exists():
+        if (p / "circuits" / "poseidon.circom").exists():
             return str(p)
     return None
 

@@ -97,8 +97,9 @@ class ZKProver:
         print("[zk_prover] Build complete.")
     
     def _find_circomlib(self) -> Optional[str]:
-        """Find circomlib installation path."""
+        """Find circomlib installation path (dir containing circuits/ for circom -l)."""
         candidates = [
+            HERE / "zk_circuits" / "circomlib",
             Path.home() / "node_modules" / "circomlib",
             Path("/usr/local/lib/node_modules/circomlib"),
             Path("/opt/homebrew/lib/node_modules/circomlib"),

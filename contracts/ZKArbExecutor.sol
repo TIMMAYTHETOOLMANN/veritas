@@ -76,7 +76,6 @@ contract ZKArbExecutor is Groth16Verifier {
     error NoProfit();
     error InvalidProof();
     error NullifierUsed();
-    error StaleStateRoot();
     
     modifier onlyOwner() {
         if (msg.sender != OWNER) revert NotOwner();
@@ -88,7 +87,9 @@ contract ZKArbExecutor is Groth16Verifier {
      * @param a Groth16 proof point a (2 uint256)
      * @param b Groth16 proof point b (2x2 uint256)
      * @param c Groth16 proof point c (2 uint256)
-     * @param publicSignals Public signals: [eth_usd, gas_usd, safety_margin, state_root, profit_usd, net_profit_usd, nullifier]
+     * @param publicSignals Public signals (3 total, all circuit OUTPUTS in declaration order):
+     *   [0] nullifier, [1] profit_usd, [2] net_profit_usd
+     *   (circuit inputs compile PRIVATE in circom 2.1.8; only `signal output` is public)
      * @param arbCalldata ABI-encoded flashloan params (buyLeg, sellLeg, quoteToken) — ONLY USED IF PROOF PASSES
      */
     function executeWithProof(
@@ -101,28 +102,19 @@ contract ZKArbExecutor is Groth16Verifier {
         // 1. Verify Groth16 proof (inherited from Groth16Verifier)
         require(verifyProof(a, b, c, publicSignals), "ZK: invalid proof");
         
-        // 2. Extract and validate public signals
-        require(publicSignals.length == 7, "ZK: invalid public signals length");
-        uint256 stateRoot = publicSignals[3];
-        bytes32 nullifier = bytes32(publicSignals[6]);
+        // 2. Extract and validate public signals (3 total: nullifier, profit, net)
+        require(publicSignals.length == 3, "ZK: invalid public signals length");
+        bytes32 nullifier = bytes32(publicSignals[0]);
         
         // 3. Replay protection: nullifier must not have been used
         require(nullifierUsedAtBlock[nullifier] == 0, "ZK: nullifier used");
         
-        // 4. State freshness: state_root must match recent block (prevents stale proofs)
-        // Allow up to 2 blocks old for network latency
-        require(
-            stateRoot == uint256(blockhash(block.number - 1)) ||
-            stateRoot == uint256(blockhash(block.number - 2)),
-            "ZK: stale state root"
-        );
-        
-        // 5. Mark nullifier as used
+        // 4. Mark nullifier as used
         nullifierUsedAtBlock[nullifier] = block.number;
         
         // 6. Extract profit for logging
-        uint256 profitUSD = publicSignals[4];
-        uint256 netProfitUSD = publicSignals[5];
+        uint256 profitUSD = publicSignals[1];
+        uint256 netProfitUSD = publicSignals[2];
         emit ProofVerified(nullifier, profitUSD, netProfitUSD);
         
         // 7. Decode arb calldata (only executed after proof passes)
