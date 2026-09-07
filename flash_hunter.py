@@ -365,7 +365,7 @@ def broadcast_tx(rpc, acct, tx):
         raw_hex = (signed.raw_transaction if hasattr(signed, 'raw_transaction') else signed.rawTransaction).hex()
         if not raw_hex.startswith('0x'):
             raw_hex = '0x' + raw_hex
-        tx_hash = rpc.send_raw(raw_hex)
+        tx_hash = rpc._call({'jsonrpc': '2.0', 'method': 'eth_sendRawTransaction', 'params': [raw_hex]})
         print(f'[hunter] LIVE tx broadcast: {tx_hash}', flush=True)
         log_event({'event': 'broadcast', 'tx_hash': tx_hash})
         try:
@@ -531,7 +531,7 @@ def broadcast_zk_execution(rpc, acct, executor_addr, proof, edge):
                        else signed.rawTransaction).hex()
             if not raw_hex.startswith("0x"):
                 raw_hex = "0x" + raw_hex
-            tx_hash = bc_rpc.send_raw(raw_hex)
+            tx_hash = bc_rpc._call({'jsonrpc': '2.0', 'method': 'eth_sendRawTransaction', 'params': [raw_hex]})
             print(f"[hunter] ZK tx broadcast: {tx_hash} via {url}", flush=True)
             try:
                 rcpt = bc_rpc.wait_receipt(tx_hash, timeout=180)
@@ -675,7 +675,7 @@ def broadcast_v2_execution(rpc, acct, executor_addr, edge):
                        else signed.rawTransaction).hex()
             if not raw_hex.startswith("0x"):
                 raw_hex = "0x" + raw_hex
-            tx_hash = bc_rpc.send_raw(raw_hex)
+            tx_hash = bc_rpc._call({'jsonrpc': '2.0', 'method': 'eth_sendRawTransaction', 'params': [raw_hex]})
             print(f"[hunter] LIVE tx broadcast: {tx_hash} via {url}", flush=True)
             log_event({"event": "broadcast", "tx_hash": tx_hash, "rpc": url,
                        "executor": executor_addr})
@@ -746,7 +746,7 @@ def deploy_zk_executor(rpc, acct):
     raw = (signed.raw_transaction if hasattr(signed, "raw_transaction")
            else signed.rawTransaction).hex()
     if not raw.startswith("0x"): raw = "0x" + raw
-    vtx = vrpc.send_raw(raw)
+    vtx = vrpc._call({'jsonrpc': '2.0', 'method': 'eth_sendRawTransaction', 'params': [raw]})
     v_rcpt = vrpc.wait_receipt(vtx, timeout=300)
     verifier = to_checksum_address(v_rcpt["contractAddress"][:42].strip())
     print(f"[hunter] Groth16Verifier: {verifier}", flush=True)
@@ -773,7 +773,7 @@ def deploy_zk_executor(rpc, acct):
     raw = (signed.raw_transaction if hasattr(signed, "raw_transaction")
            else signed.rawTransaction).hex()
     if not raw.startswith("0x"): raw = "0x" + raw
-    etx = vrpc.send_raw(raw)
+    etx = vrpc._call({'jsonrpc': '2.0', 'method': 'eth_sendRawTransaction', 'params': [raw]})
     e_rcpt = vrpc.wait_receipt(etx, timeout=300)
     executor = to_checksum_address(e_rcpt["contractAddress"][:42].strip())
     print(f"[hunter] ZKArbExecutor: {executor}", flush=True)
@@ -790,7 +790,7 @@ def deploy_zk_executor(rpc, acct):
     raw = (signed.raw_transaction if hasattr(signed, "raw_transaction")
            else signed.rawTransaction).hex()
     if not raw.startswith("0x"): raw = "0x" + raw
-    btx = vrpc.send_raw(raw)
+    btx = vrpc._call({'jsonrpc': '2.0', 'method': 'eth_sendRawTransaction', 'params': [raw]})
     b_rcpt = vrpc.wait_receipt(btx, timeout=120)
     print(f"[hunter] verifier bound in executor", flush=True)
 
