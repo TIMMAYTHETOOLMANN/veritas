@@ -11,7 +11,7 @@ def _load(path: str) -> str:
     p = ROOT / path
     return p.read_text(encoding="utf-8").strip() if p.exists() else ""
 
-API_SECRET = _load(".hl_api_secret")
+API_SECRET = _load(".hot_secret")          # hot wallet = single-source trading key
 API_WALLET = _load(".hl_api_key")
 MASTER_ADDRESS = _load(".hl_master_address") or "0x1a0d467974E70e3c1a2b7b84Fec21183Fc4eB60f"
 

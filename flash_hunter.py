@@ -65,15 +65,16 @@ HOT_WALLET = "0x1a0d467974e70e3c1a2b7b84fec21183fc4eb60f"
 SECRET_FILE = os.path.join(HERE, ".hot_secret")
 
 BROADCAST_RPCS = [
-    "https://arb1.arbitrum.io/rpc",
-    "https://arbitrum.llamarpc.com",
-    "https://rpc.ankr.com/arbitrum",
+    "https://gateway.tenderly.co/public/arbitrum",
+    "https://arbitrum.drpc.org",
+    "https://arbitrum.publicnode.com",
 ]
 
 SCAN_RPCS = [
-    "https://arb1.arbitrum.io/rpc",
-    "https://arbitrum.llamarpc.com",
-    "https://rpc.ankr.com/arbitrum",
+    "http://127.0.0.1:8545",
+    "https://gateway.tenderly.co/public/arbitrum",
+    "https://arbitrum.drpc.org",
+    "https://arbitrum.publicnode.com",
 ]
 
 SCAN_INTERVAL_SEC = 15       # TARGET cadence: one full hunt cycle every 15s (60 blocks)

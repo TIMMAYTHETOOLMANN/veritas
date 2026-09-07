@@ -12,7 +12,7 @@ include "circomlib/circuits/bitify.circom";
  *
  * This replaces the prior "synthetic Poseidon hash-chain" state commitment.
  * Each pool is a leaf in a Sparse Merkle Tree keyed by pool address. For each
- * pool the holder proves a depth-32 Poseidon sibling-path membership, then the
+ * pool the holder proves a depth-16 Poseidon sibling-path membership, then the
  * two leaf hashes are combined into the registry root.
  *
  * Public outputs (in declaration order) — snarkjs exposes ONLY `signal output`:
@@ -41,25 +41,25 @@ template PoolLeaf() {
 }
 
 template SmtMembership() {
-    // Depth-32 Sparse Merkle Tree membership via Poseidon.
-    // Proves leaf is at `dirl`-encoded position with `siblings[32]`.
+    // Depth-16 Sparse Merkle Tree membership via Poseidon.
+    // Proves leaf is at `dirl`-encoded position with `siblings[16]`.
     signal input leaf;
-    signal input siblings[32];
+    signal input siblings[16];
     signal input root;
     signal input dirl;     // 32-bit little-endian direction bits (0=left,1=right)
 
-    component hashers[33];   // index i holds level[i] -> level[i+1] via Poseidon(2)
-    component lsel[32];
-    component rsel[32];
+    component hashers[17];   // index i holds level[i] -> level[i+1] via Poseidon(2)
+    component lsel[16];
+    component rsel[16];
     component dirl_bits;
-    signal level[33];
+    signal level[17];
     level[0] <== leaf;
 
     // Decompose dirl into 32 bits (little-endian)
-    dirl_bits = Num2Bits(32);
+    dirl_bits = Num2Bits(16);
     dirl_bits.in <== dirl;
 
-    for (var i = 0; i < 32; i++) {
+    for (var i = 0; i < 16; i++) {
         hashers[i] = Poseidon(2);
 
         lsel[i] = Mux1();
@@ -76,7 +76,7 @@ template SmtMembership() {
         hashers[i].inputs[1] <== rsel[i].out;
         level[i+1] <== hashers[i].out;
     }
-    level[32] === root;
+    level[16] === root;
 }
 
 template ArbProofVerifier() {
@@ -85,6 +85,8 @@ template ArbProofVerifier() {
     signal input eth_usd;          // USD/ETH, 1e6 scale
     signal input gas_usd;          // gas cost USD, 1e6 scale
     signal input safety_margin;    // min net profit USD, 1e6 scale
+    signal input chain_id;         // domain binding: chain id (replay protection across chains)
+    signal input executor_addr;    // domain binding: executor contract address (replay across instances)
 
     // === PRIVATE INPUTS ===
     signal input pool_a_addr;
@@ -98,8 +100,8 @@ template ArbProofVerifier() {
     signal input fee_b;            // sell fee bps*100
 
     // SMT membership paths (32 siblings each) + direction bits
-    signal input path_a[32];
-    signal input path_b[32];
+    signal input path_a[16];
+    signal input path_b[16];
     signal input dirl_a;
     signal input dirl_b;
 
@@ -117,19 +119,19 @@ template ArbProofVerifier() {
     leaf_b.fee_bps <== fee_b;
 
     // === SMT MEMBERSHIP (real, production) ===
-    // Each pool proves depth-32 Sparse-Merkle membership of its leaf against the
+    // Each pool proves depth-16 Sparse-Merkle membership of its leaf against the
     // SAME on-chain registry_root. The root is the true SMT root over all pools.
     component smt_a = SmtMembership();
     smt_a.leaf <== leaf_a.leaf;
     smt_a.root <== registry_root;
     smt_a.dirl <== dirl_a;
-    for (var i = 0; i < 32; i++) { smt_a.siblings[i] <== path_a[i]; }
+    for (var i = 0; i < 16; i++) { smt_a.siblings[i] <== path_a[i]; }
 
     component smt_b = SmtMembership();
     smt_b.leaf <== leaf_b.leaf;
     smt_b.root <== registry_root;
     smt_b.dirl <== dirl_b;
-    for (var i = 0; i < 32; i++) { smt_b.siblings[i] <== path_b[i]; }
+    for (var i = 0; i < 16; i++) { smt_b.siblings[i] <== path_b[i]; }
 
     // === CPMM ARB MATH (unchanged, production) ===
     signal fee_mult_a;
@@ -235,20 +237,27 @@ template ArbProofVerifier() {
     gt_amt.out === 1;
 
     // === PUBLIC OUTPUTS (snarkjs order = declaration order) ===
-    // [0] registry_root (re-exposed so verifier can check freshness/non-replay)
-    // [1] nullifier = Poseidon(pool_a, pool_b, registry_root)
-    // [2] profit_usd
-    // [3] net_profit_usd
-    signal output registry_root_out;
-    registry_root_out <== registry_root;
+        // [0] registry_root    (re-exposed so verifier can check the SMT root)
+        // [1] nullifier        (domain-bound: Poseidon(pool_a, pool_b, root, chain_id, executor))
+        // [2] profit_usd
+        // [3] net_profit_usd
+        // [4] chain_id         (domain binding — reject cross-chain replay)
+        // [5] executor_addr    (domain binding — reject cross-instance replay)
+        signal output registry_root_out;
+        registry_root_out <== registry_root;
 
-    signal output nullifier;
-    nullifier <== Poseidon(3)([pool_a_addr, pool_b_addr, registry_root]);
+        signal output nullifier;
+        nullifier <== Poseidon(5)([pool_a_addr, pool_b_addr, registry_root, chain_id, executor_addr]);
 
-    signal output profit_usd_out;
-    signal output net_profit_usd_out;
-    profit_usd_out <== profit_usd;
-    net_profit_usd_out <== net_profit_usd;
-}
+        signal output profit_usd_out;
+        signal output net_profit_usd_out;
+        profit_usd_out <== profit_usd;
+        net_profit_usd_out <== net_profit_usd;
 
-component main = ArbProofVerifier();
+        signal output chain_id_out;
+        signal output executor_addr_out;
+        chain_id_out <== chain_id;
+        executor_addr_out <== executor_addr;
+    }
+
+    component main = ArbProofVerifier();
