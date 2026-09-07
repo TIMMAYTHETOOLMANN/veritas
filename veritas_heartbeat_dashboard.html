@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VERITAS — Heartbeat</title>
+<style>
+  :root {
+    --fg: var(--foreground, #e6edf3);
+    --muted: var(--muted-foreground, #8b949e);
+    --accent: var(--accent, #3fb950);
+    --border: var(--border, #30363d);
+    --card: var(--card, #161b22);
+    --red: #f85149;
+    --amber: #e3b341;
+    --green: #3fb950;
+    --cyan: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "SF Mono", ui-monospace, monospace;
+    color: var(--fg);
+    background: transparent;
+    font-size: 13px;
+    line-height: 1.45;
+    padding: 20px 24px;
+    min-width: 720px;
+  }
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+
+  /* --- header --- */
+  .header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+  .heart {
+    position: relative; width: 46px; height: 46px; flex-shrink: 0;
+    display: grid; place-items: center;
+  }
+  .heart .glyph {
+    font-size: 30px; line-height: 1; color: var(--red);
+    animation: beat 1.15s cubic-bezier(.28,.02,.32,1.1) infinite;
+    transform-origin: center;
+    filter: drop-shadow(0 0 8px rgba(248,81,73,.6));
+  }
+  .heart.dead .glyph { animation: none; color: var(--muted); filter: none; opacity: .5; }
+  @keyframes beat {
+    0%, 100% { transform: scale(1); }
+    18% { transform: scale(1.22); }
+    32% { transform: scale(1); }
+    48% { transform: scale(1.16); }
+    62% { transform: scale(1); }
+  }
+  .title h1 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
+  .title h1 .v { color: var(--accent); }
+  .title .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .status-pill {
+    margin-left: auto; display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
+    background: var(--card); font-size: 12px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 8px var(--green); animation: pulse 1.6s infinite; }
+  .dot.dead { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  /* --- cards --- */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--muted); margin-bottom: 10px; font-weight: 600; }
+  .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .kpi { display: flex; flex-direction: column; gap: 3px; }
+  .kpi .label { color: var(--muted); font-size: 11px; }
+  .kpi .val { font-size: 22px; font-weight: 700; letter-spacing: -.01em;
+    font-variant-numeric: tabular-nums; }
+  .val.green { color: var(--green); }
+  .val.red { color: var(--red); }
+  .val.amber { color: var(--amber); }
+  .val.cyan { color: var(--cyan); }
+  .val.mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 13px;
+    font-weight: 500; word-break: break-all; }
+
+  /* --- feed --- */
+  .feed { max-height: 560px; overflow-y: auto; }
+  .feed::-webkit-scrollbar { width: 8px; }
+  .feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .evt { padding: 8px 10px; border-left: 3px solid var(--border); margin-bottom: 6px;
+    border-radius: 4px; background: rgba(255,255,255,.02); }
+  .evt .ts { color: var(--muted); font-size: 11px; }
+  .evt .ev { font-weight: 600; margin-left: 6px; }
+  .evt .detail { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-all; }
+  .evt.cycle { border-left-color: var(--cyan); }
+  .evt.zk_scan, .evt.zk_proof { border-left-color: #bc8cff; }
+  .evt.sim { border-left-color: var(--amber); }
+  .evt.broadcast, .evt.executor_zk_deployed { border-left-color: var(--green); }
+  .evt.cycle_error { border-left-color: var(--red); }
+
+  /* --- scan console --- */
+  .console {
+    background: #0d1117; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 11.5px; max-height: 200px; overflow-y: auto; white-space: pre-wrap;
+    color: #7ee787;
+  }
+  .console .heartbeat-line { color: var(--cyan); }
+
+  .addr { font-family: ui-monospace, "SF Mono", monospace; font-size: 11px;
+    color: var(--cyan); }
+  .split { display:flex; justify-content: space-between; align-items: baseline; }
+  .tiny { font-size: 10.5px; color: var(--muted); }
+  .progress { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .progress > div { height: 100%; background: var(--green); transition: width .6s ease; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="heart" id="heart"><span class="glyph">♥</span></div>
+  <div class="title">
+    <h1><span class="v">VERITAS</span> — Living Heartbeat</h1>
+    <div class="sub">Autonomous flash-loan arbitrage · Arbitrum · ShadowPath ZK gate</div>
+  </div>
+  <div class="status-pill">
+    <span class="dot" id="dot"></span>
+    <span id="statusText">CONNECTING…</span>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- LEFT: performance + identity -->
+  <div>
+    <div class="card">
+      <h2>Capital & P&amp;L</h2>
+      <div class="kpi-grid">
+        <div class="kpi"><span class="label">Profit (USD)</span>
+          <span class="val" id="profit">—</span></div>
+        <div class="kpi"><span class="label">Gas Spent (USD)</span>
+          <span class="val" id="gas">—</span></div>
+        <div class="kpi"><span class="label">Starting Capital</span>
+          <span class="val" id="starting">—</span></div>
+        <div class="kpi"><span class="label">Deployable</span>
+          <span class="val" id="deployable">—</span></div>
+        <div class="kpi"><span class="label">Trades Executed</span>
+          <span class="val" id="trades">—</span></div>
+        <div class="kpi"><span class="label">Win / Loss</span>
+          <span class="val" id="wl">—</span></div>
+      </div>
+      <div style="margin-top:12px">
+        <div class="split"><span class="label">ROI</span>
+          <span class="val" id="roi" style="font-size:16px">—</span></div>
+        <div class="progress"><div id="roiBar" style="width:0%"></div></div>
+      </div>
+      <div class="split" style="margin-top:10px"><span class="tiny" id="phase">phase: —</span>
+        <span class="tiny" id="lastCycle">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Identity &amp; Contracts</h2>
+      <div class="kpi-grid" style="grid-template-columns:1fr">
+        <div class="kpi"><span class="label">Hot Wallet (destination)</span>
+          <span class="val mono addr" id="wallet">—</span></div>
+        <div class="kpi"><span class="label">Executor</span>
+          <span class="val mono addr" id="executor">—</span></div>
+        <div class="kpi"><span class="label">Exec V2</span>
+          <span class="val mono addr" id="execV2">—</span></div>
+        <div class="kpi"><span class="label">ZK Executor</span>
+          <span class="val mono addr" id="execZK">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Scan Cycle (live)</h2>
+      <div class="kpi-grid">
+        <div class="kpi"><span class="label">ETH / USD</span>
+          <span class="val cyan" id="eth">—</span></div>
+        <div class="kpi"><span class="label">Total Cycles</span>
+          <span class="val" id="cycles">—</span></div>
+        <div class="kpi"><span class="label">ZK Scans</span>
+          <span class="val" id="zkScans">—</span></div>
+        <div class="kpi"><span class="label">Errors</span>
+          <span class="val" id="errors">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: live activity -->
+  <div>
+    <div class="card">
+      <h2>Live Console</h2>
+      <div class="console" id="console">waiting for engine output…</div>
+    </div>
+    <div class="card">
+      <h2>Event Feed</h2>
+      <div class="feed" id="feed"><div class="tiny">no events yet</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmtUsd = v => (v==null||v===""||isNaN(v)) ? "—" : "$"+Number(v).toFixed(2);
+const fmtPct = v => (v==null||v===""||isNaN(v)) ? "—" : Number(v).toFixed(2)+"%";
+const short = a => a ? (a.slice(0,6)+"…"+a.slice(-4)) : "—";
+
+let lastSeenUnix = 0;
+let pollTimer = null;
+
+const EVT_META = {
+  capital_state: ['cycle','Capital state'],
+  cycle: ['cycle','Cycle'],
+  zk_scan: ['zk_scan','ZK scan'],
+  sim: ['sim','Sim gate'],
+  broadcast: ['broadcast','Broadcast'],
+  broadcast_refused: ['cycle_error','Broadcast refused'],
+  zk_proof: ['zk_proof','ZK proof'],
+  executor_zk_deployed: ['executor_zk_deployed','Deployed'],
+  deploy: ['broadcast','Deploy'],
+  cycle_error: ['cycle_error','Error'],
+};
+
+function renderEvent(e) {
+  const [cls, label] = EVT_META[e.event] || ['','unmapped'];
+  const div = document.createElement('div');
+  div.className = 'evt ' + cls;
+  const ts = (e.ts || '').slice(11) || '';
+  div.innerHTML = `<span class="ts">${ts}</span><span class="ev">${label}</span>`;
+  // build detail line from meaningful fields
+  let d = [];
+  for (const k of ['edges','passes','zk_edges','duration_sec','tx_hash','error','phase']) {
+    if (e[k] !== undefined && e[k] !== null) {
+      if (k === 'error') d.push('err='+String(e[k]).slice(0,80));
+      else if (k === 'duration_sec') d.push('dur='+Number(e[k]).toFixed(1)+'s');
+      else d.push(k+'='+String(e[k]).slice(0,40));
+    }
+  }
+  if (d.length) {
+    const sp = document.createElement('div');
+    sp.className = 'detail';
+    sp.textContent = d.join(' · ');
+    div.appendChild(sp);
+  }
+  return div;
+}
+
+function render(state) {
+  // aliveness
+  const alive = (state.now_unix - lastSeenUnix) < 30;
+  lastSeenUnix = state.now_unix;
+  $('dot').className = 'dot' + (alive ? '' : ' dead');
+  $('heart').className = 'heart' + (alive ? '' : ' dead');
+  $('statusText').textContent = alive ? 'LIVE' : 'STALLED';
+
+  const cap = state.capital || {};
+  const profit = cap.total_profit_usd;
+  $('profit').textContent = fmtUsd(profit);
+  $('profit').className = 'val ' + (profit > 0 ? 'green' : profit < 0 ? 'red' : '');
+  $('gas').textContent = fmtUsd(cap.total_gas_usd);
+  $('starting').textContent = fmtUsd(cap.starting_usd);
+  $('deployable').textContent = fmtUsd(cap.deployable_usd);
+  $('trades').textContent = (cap.trades ?? 0);
+  $('wl').textContent = (cap.wins ?? 0) + ' / ' + (cap.losses ?? 0);
+  $('roi').textContent = fmtPct(cap.roi_pct);
+  $('roi').className = 'val ' + ((cap.roi_pct||0) > 0 ? 'green' : (cap.roi_pct||0) < 0 ? 'red' : '');
+  // ROI bar: map -5%..+25% to 0..100%
+  const roi = cap.roi_pct || 0;
+  const pct = Math.max(0, Math.min(100, (roi + 5) / 30 * 100));
+  $('roiBar').style.width = pct + '%';
+  $('phase').textContent = 'phase: ' + (cap.phase || '—');
+
+  // identity
+  $('wallet').textContent = state.wallet || '—';
+  $('executor').textContent = state.executor || '—';
+  $('execV2').textContent = state.executor_v2 || '—';
+  $('execZK').textContent = state.executor_zk || '—';
+
+  // cycle
+  $('eth').textContent = state.eth_usd ? '$'+Number(state.eth_usd).toFixed(0) : '—';
+  $('cycles').textContent = state.counts?.cycles ?? 0;
+  $('zkScans').textContent = state.counts?.zk_scans ?? 0;
+  $('errors').textContent = state.counts?.errors ?? 0;
+  $('errors').className = 'val ' + ((state.counts?.errors||0) > 0 ? 'red' : '');
+  const lc = state.last_cycle;
+  $('lastCycle').textContent = lc ? ('last cycle: '+lc.duration_sec?.toFixed(1)+'s · edges '+lc.edges) : '';
+
+  // console
+  const con = $('console');
+  if (state.scan_lines && state.scan_lines.length) {
+    con.innerHTML = '';
+    for (const ln of state.scan_lines) {
+      const div = document.createElement('div');
+      if (ln.includes('heartbeat:')) div.className = 'heartbeat-line';
+      div.textContent = ln;
+      con.appendChild(div);
+    }
+  }
+  con.scrollTop = con.scrollHeight;
+
+  // feed (append newest)
+  const feedEl = $('feed');
+  if (state.feed && state.feed.length) {
+    // simple render-all on each poll; cheap at <80 items
+    feedEl.innerHTML = '';
+    for (const e of state.feed) feedEl.appendChild(renderEvent(e));
+  }
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+
+async function poll() {
+  try {
+    const r = await fetch('http://127.0.0.1:8999/state', {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const state = await r.json();
+    render(state);
+  } catch (err) {
+    $('statusText').textContent = 'OFFLINE';
+    $('dot').className = 'dot dead';
+    $('heart').className = 'heart dead';
+  }
+}
+
+poll();
+pollTimer = setInterval(poll, 2000);
+</script>
+</body>
+</html>
