@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APEX — Funding Carry Engine</title>
+<style>
+  :root {
+    --fg: var(--foreground, #e6edf3);
+    --muted: var(--muted-foreground, #8b949e);
+    --accent: var(--accent, #3fb950);
+    --border: var(--border, #30363d);
+    --card: var(--card, #161b22);
+    --red: #f85149;
+    --amber: #e3b341;
+    --green: #3fb950;
+    --cyan: #58a6ff;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-monospace, monospace;
+    color: var(--fg); background: transparent; font-size: 13px; line-height: 1.45;
+    padding: 20px 24px; min-width: 760px;
+  }
+  .header { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+  .pulse { width: 12px; height: 12px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 10px var(--green); animation: pulse 1.6s infinite; }
+  .pulse.dead { background: var(--red); box-shadow: 0 0 10px var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  .title h1 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
+  .title h1 .a { color: var(--accent); }
+  .title .sub { color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1; }
+  .pill { padding: 5px 14px; border-radius: 20px; border: 1px solid var(--border);
+    background: var(--card); font-size: 12px; display: flex; align-items: center; gap: 8px; }
+
+  .grid { display: grid; grid-template-columns: 380px 1fr; gap: 18px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--muted); margin-bottom: 10px; font-weight: 600; }
+
+  .equity { font-size: 40px; font-weight: 700; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums; }
+  .equity.up { color: var(--green); } .equity.down { color: var(--red); }
+  .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .kpi .label { color: var(--muted); font-size: 11px; }
+  .kpi .val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .val.green { color: var(--green); } .val.red { color: var(--red); }
+  .val.cyan { color: var(--cyan); } .val.purple { color: var(--purple); }
+
+  .pos { display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .pos:last-child { border-bottom: none; }
+  .pos .c { font-weight: 700; font-size: 14px; }
+  .pos .dir { font-size: 10px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
+  .dir.LONG { background: rgba(63,185,80,.15); color: var(--green); }
+  .dir.SHORT { background: rgba(248,81,73,.15); color: var(--red); }
+  .pos .pnl { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pnl.pos { color: var(--green); } .pnl.neg { color: var(--red); }
+  .pos .sz { color: var(--muted); font-size: 11px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 5px 8px;
+    border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums; }
+  tr:hover td { background: rgba(255,255,255,.02); }
+  .rate.neg { color: var(--green); } .rate.pos { color: var(--red); }
+  .mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 11px; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="pulse" id="dot"></div>
+  <div class="title">
+    <h1><span class="a">APEX</span> — Funding Carry Engine</h1>
+    <div class="sub">Aggressive auto-compounding · Hyperliquid perps · cross-margin 3x</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill"><span id="status">CONNECTING…</span></div>
+</div>
+
+<div class="grid">
+  <!-- LEFT: equity + positions -->
+  <div>
+    <div class="card">
+      <h2>Account Equity (live)</h2>
+      <div class="equity" id="equity">—</div>
+      <div class="kpi-grid">
+        <div class="kpi"><span class="label">Total Notional (levered)</span>
+          <span class="val cyan" id="ntl">—</span></div>
+        <div class="kpi"><span class="label">Margin Used</span>
+          <span class="val" id="margin">—</span></div>
+        <div class="kpi"><span class="label">Spot USDC</span>
+          <span class="val purple" id="spot">—</span></div>
+        <div class="kpi"><span class="label">Implied Leverage</span>
+          <span class="val" id="lev">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Open Positions</h2>
+      <div id="positions"><div class="pos"><span class="sub">none</span></div></div>
+    </div>
+
+    <div class="card">
+      <h2>Wallet</h2>
+      <div class="mono" id="addr">—</div>
+    </div>
+  </div>
+
+  <!-- RIGHT: funding opportunity feed -->
+  <div>
+    <div class="card">
+      <h2>Top Funding-Carry Opportunities</h2>
+      <table>
+        <thead><tr><th>Coin</th><th>Dir</th><th>Funding/hr</th><th>Premium</th><th>OI</th><th>MaxLev</th></tr></thead>
+        <tbody id="edges"><tr><td colspan="6">loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const usd = v => (v==null||isNaN(v)) ? "—" : "$"+Number(v).toFixed(2);
+const pct = v => (v==null||isNaN(v)) ? "—" : (v*100).toFixed(3)+"%";
+const compact = v => v>=1e9 ? (v/1e9).toFixed(1)+"B" : v>=1e6 ? (v/1e6).toFixed(1)+"M" : v>=1e3 ? (v/1e3).toFixed(1)+"K" : v.toFixed(0);
+
+let lastSeen = 0;
+
+function render(s) {
+  const alive = (s.now_unix - lastSeen) < 30;
+  lastSeen = s.now_unix;
+  $('dot').className = 'pulse' + (alive ? '' : ' dead');
+  $('status').textContent = alive ? 'LIVE' : (s.error ? 'ERROR' : 'STALLED');
+
+  const eq = s.account_value || 0;
+  $('equity').textContent = usd(eq);
+  $('equity').className = 'equity ' + (eq >= 0 ? '' : 'down');
+  $('ntl').textContent = usd(s.total_ntl);
+  $('margin').textContent = usd(s.margin_used);
+  $('spot').textContent = usd(s.spot_usdc);
+  const lev = eq > 0 ? (s.total_ntl / eq) : 0;
+  $('lev').textContent = lev.toFixed(1) + "x";
+  $('lev').className = 'val ' + (lev > 3 ? 'red' : 'cyan');
+
+  // positions
+  const posEl = $('positions');
+  const pos = s.positions || [];
+  if (!pos.length) {
+    posEl.innerHTML = '<div class="pos"><span class="sub">no open positions</span></div>';
+  } else {
+    posEl.innerHTML = '';
+    for (const p of pos) {
+      const d = document.createElement('div');
+      d.className = 'pos';
+      const dir = p.szi >= 0 ? 'LONG' : 'SHORT';
+      const pnlCls = p.uPnl >= 0 ? 'pos' : 'neg';
+      d.innerHTML = `<div><span class="c">${p.coin}</span>
+        <span class="dir ${dir}">${dir}</span></div>
+        <div class="sz">${Math.abs(p.szi)} @ ${p.entry}</div>
+        <div class="pnl ${pnlCls}">${p.uPnl>=0?'+':''}$${p.uPnl.toFixed(2)}</div>`;
+      posEl.appendChild(d);
+    }
+  }
+
+  $('addr').textContent = s.address || "—";
+
+  // edges table
+  const edgeEl = $('edges');
+  const edges = s.edges || [];
+  if (!edges.length) { edgeEl.innerHTML = '<tr><td colspan="6">no viable edges</td></tr>'; return; }
+  edgeEl.innerHTML = '';
+  for (const e of edges) {
+    const tr = document.createElement('tr');
+    const rateCls = e.funding < 0 ? 'neg' : 'pos';
+    const fc = (e.funding*100).toFixed(3) + '%';
+    tr.innerHTML = `<td><b>${e.name}</b></td>
+      <td><span class="dir ${e.dir}">${e.dir}</span></td>
+      <td class="rate ${rateCls}">${e.funding<0?'−':'+'}${(Math.abs(e.funding)*100).toFixed(3)}%</td>
+      <td>${pct(e.premium)}</td>
+      <td>$${compact(e.oi_ntl)}</td>
+      <td>${e.maxLev}x</td>`;
+    edgeEl.appendChild(tr);
+  }
+}
+
+async function poll() {
+  try {
+    const r = await fetch('http://127.0.0.1:8999/state', {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    render(await r.json());
+  } catch (e) {
+    $('dot').className = 'pulse dead';
+    $('status').textContent = 'OFFLINE';
+  }
+}
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

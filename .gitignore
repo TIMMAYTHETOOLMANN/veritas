@@ -84,6 +84,13 @@ FINAL_STATUS.md
 .hot_secret
 burner_wallet_bundle.json
 
+# Exposed secrets (committed in history — see INCIDENT_REPORT.md) — never re-add
+.fresh_private_key
+.fresh_address
+.hl_api_key
+.hl_api_secret
+.hl_master_address
+
 # Node / JS (the Python engine does not need node_modules)
 node_modules/
 package-lock.json

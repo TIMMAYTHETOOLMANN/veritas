@@ -181,7 +181,7 @@ def scan_registry_cross_venue(rpc, gas_usd=None, eth_usd=None, size_steps=10,
     if eth_usd is None:
         eth_usd = eth_usd_approx(rpc)
     if gas_usd is None:
-        gas_price = uint(rpc.call("eth_gasPrice", [])) or 0
+        gas_price = rpc.eth_gasPrice() or 0
         gas_usd = (gas_price * GAS_UNITS / 1e18) * eth_usd
 
     pools = load_pools(rpc)
