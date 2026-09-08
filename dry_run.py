@@ -26,7 +26,7 @@ print("capital_summary=", controller.summary())
 print("gas_usd=", round(gas_usd, 6))
 print("target_trade_usd=", round(target_trade_usd, 6))
 
-edges, report = arb_engine.scan_cross_venue(
+scan_result = arb_engine.scan_cross_venue(
     rpc,
     2500.0,
     gas_usd,
@@ -34,8 +34,12 @@ edges, report = arb_engine.scan_cross_venue(
     max_venues_per_quote=8,
     target_trade_usd=target_trade_usd,
 )
+edges = scan_result.edges
+report = scan_result.to_legacy_tuple()[1]
 print("cross_venue_edges=", len(edges))
 print("report_top=", report[:5])
+# Print the WHY ZERO? diagnostic report
+print("\n" + scan_result.generate_why_zero_report())
 
 print("\n=== CANDIDATE EDGES ===")
 for i, edge in enumerate(edges[:20]):

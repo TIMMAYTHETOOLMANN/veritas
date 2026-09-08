@@ -30,6 +30,8 @@ from typing import Dict, List, Optional, Tuple, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.rpc import RPC, uint
+from core.scan_result import ScanResult
+from core.opportunity_telemetry import Candidate, CandidateStatus, RejectionReason
 try:
     from zk_prover import ZKProver
 except Exception as _zk_err:  # ZK is optional; the hunter must survive without it
@@ -43,6 +45,23 @@ AAVE_FLASH_FEE = 0.0005
 GAS_UNITS = 350_000
 FORK_URL = "http://127.0.0.1:8545"
 DEFAULT_RPC_URL = "https://gateway.tenderly.co/public/arbitrum"
+
+# ---- Size-curve configuration ------------------------------------------
+# Logarithmic probe grid in USD.  The scanner evaluates each candidate
+# at every size in this grid (subject to bounds) to construct a
+# net_profit(size) curve.
+PROBE_GRID_USD: List[float] = [
+    0.10, 0.25, 0.50, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0,
+]
+
+# Fraction of pool liquidity we will not exceed (safety margin against
+# moving the price too far in the simulation).
+MAX_POOL_LIQUIDITY_FRACTION: float = 0.05
+
+# Maximum trade size as a fraction of deployable capital.
+# Aligned with core/capital_controller.py SIZE_CAP_FRACTION.
+MAX_CAPITAL_FRACTION: float = 0.10
+
 # -----------------------
 
 ZK_PROVER = None  # ZKProver may be None when ZK is unavailable
@@ -126,19 +145,23 @@ def discover_tokens_and_pairs(rpc: RPC) -> None:
 
     pair_cache = {}
     discovered_tokens = {}
+    # Query ALL factories for pair discovery (Phase 4: venue expansion)
+    all_factories = [SUSHI_FACTORY, UNIV2_FACTORY, CAMELOT_FACTORY]
     for quote in (WETH, USDC):
         for base in seed_tokens:
             if base == quote:
                 continue
-            try:
-                p = univ2_pair(rpc, SUSHI_FACTORY, base, quote)
-                if p:
-                    pair_cache[(base, quote)] = p
-                    pair_cache[(quote, base)] = p
-                    discovered_tokens[base] = seed_tokens[base]
-                    discovered_tokens[quote] = seed_tokens[quote]
-            except Exception:
-                pass
+            for factory in all_factories:
+                try:
+                    p = univ2_pair(rpc, factory, base, quote)
+                    if p:
+                        pair_cache[(base, quote)] = p
+                        pair_cache[(quote, base)] = p
+                        discovered_tokens[base] = seed_tokens[base]
+                        discovered_tokens[quote] = seed_tokens[quote]
+                        break  # Found a pair for this base/quote, move on
+                except Exception:
+                    pass
 
     TOKENS = discovered_tokens
     TOKEN_DECIMALS_CACHE = decimals_cache
@@ -499,7 +522,126 @@ def build_edge(pool_buy: Dict[str, Any], pool_sell: Dict[str, Any], quote_token:
     }
 
 
-def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int = 12, max_venues_per_quote: int = 8, use_multi_hop: bool = True, use_parallel: bool = True, target_trade_usd: float = 0.0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def bounded_probe_sizes(
+    capital_usd: float,
+    pool_liquidity_usd: float,
+    exposure_limit_usd: float = 0.0,
+    simulation_limit_usd: float = 0.0,
+) -> List[float]:
+    """
+    Truncate PROBE_GRID_USD to the tightest applicable bound.
+
+    The ceiling is the minimum of:
+      - capital_usd * MAX_CAPITAL_FRACTION  (never exceed fraction of capital)
+      - pool_liquidity_usd * MAX_POOL_LIQUIDITY_FRACTION  (never move pool too far)
+      - exposure_limit_usd                  (configured hard ceiling)
+      - simulation_limit_usd                (sim can't handle beyond this)
+
+    If exposure_limit_usd or simulation_limit_usd is 0, that bound is ignored.
+    """
+    ceiling = capital_usd * MAX_CAPITAL_FRACTION
+    pool_ceiling = pool_liquidity_usd * MAX_POOL_LIQUIDITY_FRACTION
+    ceiling = min(ceiling, pool_ceiling)
+
+    if exposure_limit_usd > 0:
+        ceiling = min(ceiling, exposure_limit_usd)
+    if simulation_limit_usd > 0:
+        ceiling = min(ceiling, simulation_limit_usd)
+
+    # Ensure we always have at least the smallest probe size
+    bounded = [s for s in PROBE_GRID_USD if s <= ceiling]
+    if not bounded:
+        bounded = [PROBE_GRID_USD[0]]  # Always try at least the smallest size
+
+    return bounded
+
+
+def analyze_size_curve(
+    forward_quotes: List[Dict],
+    reverse_queries: List[Dict],
+    quote_token: str,
+    eth_usd: float,
+    gas_usd: float,
+    capital_usd: float,
+    pool_liquidity_usd: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Evaluate a cross-venue candidate across the bounded probe grid.
+
+    Returns a dict with:
+      - size_curve: [(size_usd, net_profit), ...]
+      - optimal_size_usd: size with peak net profit
+      - peak_net_profit_usd: maximum net profit
+      - min_profitable_size_usd: smallest size with positive net
+      - max_profitable_size_usd: largest size with positive net
+      - best_edge: the edge dict at the optimal size (or None)
+    """
+    curve: List[Tuple[float, float]] = []
+    best_edge = None
+    best_size = 0.0
+    best_net = -float('inf')
+
+    sizes_usd = bounded_probe_sizes(capital_usd, pool_liquidity_usd)
+
+    for fb in forward_quotes:
+        for rb in reverse_queries:
+            if fb.get("factory") == rb.get("factory"):
+                continue
+            if fb.get("pair_addr") == rb.get("pair_addr"):
+                continue
+
+            for size_usd in sizes_usd:
+                size_wei = int((size_usd / eth_usd) * 1e18)
+                size_wei = max(size_wei, 10 ** 15)  # floor at 0.001 ETH
+
+                edge = build_edge(fb, rb, quote_token, size_wei)
+                net = edge.get("net_margin", 0.0)
+                curve.append((size_usd, net))
+
+                if net > best_net:
+                    best_net = net
+                    best_size = size_usd
+                    best_edge = edge
+
+    # Identify profitable range
+    profitable = [(s, p) for s, p in curve if p > 0]
+
+    return {
+        "size_curve": curve,
+        "optimal_size_usd": best_size,
+        "peak_net_profit_usd": best_net,
+        "min_profitable_size_usd": min((s for s, _ in profitable), default=0.0),
+        "max_profitable_size_usd": max((s for s, _ in profitable), default=0.0),
+        "best_edge": best_edge,
+    }
+
+
+def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int = 12, max_venues_per_quote: int = 8, use_multi_hop: bool = True, use_parallel: bool = True, target_trade_usd: float = 0.0) -> ScanResult:
+    """
+    Cross-venue arbitrage scanner with full lifecycle telemetry.
+
+    Returns a ScanResult that is backward-compatible via .edges (List[Dict])
+    while also exposing .candidates, .rejections, .statistics, and
+    .generate_why_zero_report() for diagnostics.
+    """
+    # Initialize the scan result container
+    result = ScanResult()
+    result.scan_metadata = {
+        "timestamp": time.time(),
+        "block_number": _safe_block_number(rpc),
+        "eth_usd": eth_usd,
+        "gas_usd": gas_usd,
+        "size_steps": size_steps,
+    }
+    result.statistics = {
+        "pairs_discovered": 0,
+        "quotes_attempted": 0,
+        "valid_quotes": 0,
+        "cross_venue_candidates": 0,
+        "simulation_candidates": 0,
+        "simulation_passes": 0,
+    }
+
     if not TOKENS:
         discover_tokens_and_pairs(rpc)
 
@@ -508,58 +650,249 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
         tokens.remove(WETH)
     tokens = tokens[:max_venues_per_quote]
 
-    factories = [SUSHI_FACTORY, UNIV2_FACTORY]
-    if target_trade_usd > 0 and eth_usd > 0:
-        size_wei = int((target_trade_usd / eth_usd) * 1e18)
-        size_wei = max(size_wei, 10 ** 17)
-    else:
-        size_wei = 10 ** 18
-    sizes = [size_wei]
+    # Phase 4: Include Camelot factory for broader venue coverage
+    factories = [SUSHI_FACTORY, UNIV2_FACTORY, CAMELOT_FACTORY]
 
-    edges: List[Dict[str, Any]] = []
-    report: List[Dict[str, Any]] = []
+    # Use deployable capital from the controller for sizing bounds.
+    # Falls back to target_trade_usd if no controller is provided.
+    if target_trade_usd > 0 and eth_usd > 0:
+        capital_usd = target_trade_usd / MAX_CAPITAL_FRACTION  # infer capital from target
+    else:
+        capital_usd = 10.0  # conservative default
+
+    result.statistics["pairs_discovered"] = len(tokens)
 
     for token_a in tokens:
         quotes: Dict[str, Dict[str, Any]] = {}
+        # Use the largest probe size for initial quote discovery
+        # (we'll re-quote at each size during curve analysis)
+        size_wei = int((PROBE_GRID_USD[-1] / eth_usd) * 1e18)
+        size_wei = max(size_wei, 10 ** 17)
+
         for factory in factories:
-            for size in sizes:
-                fb = _quote_edge(rpc, WETH, token_a, size, factory)
-                if fb:
-                    quotes.setdefault("forward", []).append(fb)
-                rb = _quote_edge(rpc, token_a, WETH, size, factory)
-                if rb:
-                    quotes.setdefault("reverse", []).append(rb)
+            result.statistics["quotes_attempted"] += 2
+            fb = _quote_edge(rpc, WETH, token_a, size_wei, factory)
+            if fb:
+                quotes.setdefault("forward", []).append(fb)
+                result.statistics["valid_quotes"] += 1
+            rb = _quote_edge(rpc, token_a, WETH, size_wei, factory)
+            if rb:
+                quotes.setdefault("reverse", []).append(rb)
+                result.statistics["valid_quotes"] += 1
 
         forward = quotes.get("forward", [])
         reverse = quotes.get("reverse", [])
         if len(forward) < 1 or len(reverse) < 1:
+            # Record why we couldn't form cross-venue pairs for this token
+            if len(forward) == 0 and len(reverse) == 0:
+                result.record_rejection(RejectionReason.NO_QUOTE)
+            elif len(forward) == 0:
+                result.record_rejection(RejectionReason.NO_LIQUIDITY)
+            else:
+                result.record_rejection(RejectionReason.NO_LIQUIDITY)
             continue
 
-        for fb in forward:
-            for rb in reverse:
-                if fb.get("factory") == rb.get("factory"):
-                    continue
-                if fb.get("pair_addr") == rb.get("pair_addr"):
-                    continue
-                edge = build_edge(fb, rb, token_a, size_wei)
-                if edge.get("net_margin", 0) > MIN_SAFETY_MARGIN_USD:
-                    edges.append(edge)
-                report.append({
-                    "token": token_a,
-                    "size_weth": edge.get("size_weth"),
-                    "net_margin": edge.get("net_margin"),
-                    "gross_profit": edge.get("gross_profit"),
-                    "buy_factory": fb.get("factory"),
-                    "sell_factory": rb.get("factory"),
-                })
+        # Use bounded size-curve analysis instead of single-point sizing
+        # Estimate pool liquidity from the forward quote's reserves
+        pool_liquidity_usd = _estimate_pool_liquidity(forward, reverse, eth_usd)
+
+        curve_result = analyze_size_curve(
+            forward, reverse, token_a, eth_usd, gas_usd,
+            capital_usd, pool_liquidity_usd,
+        )
+
+        # Record all curve points as candidates
+        if curve_result["size_curve"]:
+            result.statistics["cross_venue_candidates"] += 1
+        elif forward and reverse:
+            # Quotes existed but all were same-factory — no cross-venue possible
+            result.record_rejection(RejectionReason.INVALID_PAIR)
+
+            # Build a candidate with the full size curve
+            best_edge = curve_result.get("best_edge")
+            if best_edge:
+                fb = forward[0]  # Use first forward for venue info
+                rb = reverse[0]  # Use first reverse for venue info
+                candidate = _edge_to_candidate(
+                    best_edge, fb, rb, token_a, eth_usd, gas_usd, result
+                )
+                # Attach size-curve metadata
+                candidate.size_curve = curve_result["size_curve"]
+                candidate.optimal_size_usd = curve_result["optimal_size_usd"]
+                candidate.peak_net_profit_usd = curve_result["peak_net_profit_usd"]
+                candidate.min_profitable_size_usd = curve_result["min_profitable_size_usd"]
+                candidate.max_profitable_size_usd = curve_result["max_profitable_size_usd"]
+                result.candidates.append(candidate)
+
+                net_margin = best_edge.get("net_margin", 0)
+                if net_margin > MIN_SAFETY_MARGIN_USD:
+                    candidate.status = CandidateStatus.ECONOMICALLY_VIABLE
+                    result.edges.append(best_edge)
+                else:
+                    # Determine the specific rejection reason
+                    gross = best_edge.get("gross_profit", 0)
+                    fee = gross * AAVE_FLASH_FEE if gross > 0 else 0
+                    if gross <= 0:
+                        candidate.reject(RejectionReason.INSUFFICIENT_SPREAD)
+                        result.record_rejection(RejectionReason.INSUFFICIENT_SPREAD)
+                    elif fee >= gross:
+                        candidate.reject(RejectionReason.FEE_REJECTION)
+                        result.record_rejection(RejectionReason.FEE_REJECTION)
+                    elif net_margin <= 0:
+                        candidate.reject(RejectionReason.GAS_REJECTION)
+                        result.record_rejection(RejectionReason.GAS_REJECTION)
+                    else:
+                        candidate.reject(RejectionReason.SAFETY_MARGIN_REJECTION)
+                        result.record_rejection(RejectionReason.SAFETY_MARGIN_REJECTION)
 
     # Scan V3 pools for arbitrage opportunities
     v3_edges = _scan_v3_pools(rpc, eth_usd, gas_usd, size_wei)
-    edges.extend(v3_edges)
+    result.edges.extend(v3_edges)
 
-    edges.sort(key=lambda e: e.get("net_margin", 0), reverse=True)
-    report.sort(key=lambda r: r.get("net_margin", 0), reverse=True)
-    return edges, report[:20]
+    # Add V3 candidates to telemetry
+    for v3_edge in v3_edges:
+        candidate = _v3_edge_to_candidate(v3_edge, eth_usd, gas_usd, result)
+        candidate.status = CandidateStatus.ECONOMICALLY_VIABLE
+        result.candidates.append(candidate)
+
+    result.edges.sort(key=lambda e: e.get("net_margin", 0), reverse=True)
+
+    # If no edges but we had candidates, record NO_OPPORTUNITY for the best one
+    if not result.edges and result.candidates:
+        best = max(result.candidates, key=lambda c: c.net_profit_usd)
+        if best.net_profit_usd <= 0 and not best.rejection_reason:
+            best.reject(RejectionReason.NO_OPPORTUNITY)
+            result.record_rejection(RejectionReason.NO_OPPORTUNITY)
+
+    # Generate the human-readable report
+    result.why_zero_report = result.generate_why_zero_report()
+
+    return result
+
+
+def _edge_to_candidate(edge: dict, fb: dict, rb: dict, quote_token: str,
+                       eth_usd: float, gas_usd: float,
+                       scan_result: ScanResult) -> Candidate:
+    """Convert a V2 edge dict into a telemetry Candidate."""
+    size_weth = edge.get("size_weth", 0.0)
+    gross = edge.get("gross_profit", 0.0)
+    net = edge.get("net_margin", 0.0)
+    factory_buy = fb.get("factory", "")
+    factory_sell = rb.get("factory", "")
+
+    # Derive human-readable venue names
+    buy_venue = _factory_name(factory_buy)
+    sell_venue = _factory_name(factory_sell)
+
+    block_number = scan_result.scan_metadata.get("block_number", 0)
+
+    return Candidate(
+        token_pair=(WETH, quote_token),
+        buy_venue=buy_venue,
+        sell_venue=sell_venue,
+        route=f"WETH -> {_symbol(quote_token)} -> WETH",
+        input_amount=size_weth * eth_usd,
+        output_amount=(size_weth * eth_usd) + gross if gross > 0 else size_weth * eth_usd,
+        implied_spread_bps=(gross / (size_weth * eth_usd) * 10000) if size_weth > 0 else 0,
+        gross_profit_usd=gross,
+        swap_fees_usd=gross * AAVE_FLASH_FEE if gross > 0 else 0,
+        flash_loan_fee_usd=size_weth * eth_usd * AAVE_FLASH_FEE,
+        estimated_gas_usd=gas_usd,
+        estimated_slippage_usd=gross * AAVE_FLASH_FEE * 0.1 if gross > 0 else 0,
+        safety_margin_usd=MIN_SAFETY_MARGIN_USD,
+        net_profit_usd=net,
+        status=CandidateStatus.CANDIDATE,
+        block_number=block_number,
+        quote_source=f"{buy_venue}/{sell_venue}",
+        confidence=0.8 if net > MIN_SAFETY_MARGIN_USD else 0.3,
+    )
+
+
+def _v3_edge_to_candidate(edge: dict, eth_usd: float, gas_usd: float,
+                           scan_result: ScanResult) -> Candidate:
+    """Convert a V3 edge dict into a telemetry Candidate."""
+    size_weth = edge.get("size_weth", 0.0)
+    gross = edge.get("gross_profit", 0.0)
+    net = edge.get("net_margin", 0.0)
+    fee_buy = edge.get("v3_fee_buy", 0)
+    fee_sell = edge.get("v3_fee_sell", 0)
+    quote_token = edge.get("token_b", "")
+    block_number = scan_result.scan_metadata.get("block_number", 0)
+
+    return Candidate(
+        token_pair=(WETH, quote_token),
+        buy_venue=f"V3_{fee_buy}",
+        sell_venue=f"V3_{fee_sell}",
+        route=f"WETH -> {_symbol(quote_token)} -> WETH",
+        input_amount=size_weth * eth_usd,
+        output_amount=(size_weth * eth_usd) + gross if gross > 0 else size_weth * eth_usd,
+        implied_spread_bps=(gross / (size_weth * eth_usd) * 10000) if size_weth > 0 else 0,
+        gross_profit_usd=gross,
+        swap_fees_usd=gross * AAVE_FLASH_FEE if gross > 0 else 0,
+        flash_loan_fee_usd=size_weth * eth_usd * AAVE_FLASH_FEE,
+        estimated_gas_usd=gas_usd,
+        estimated_slippage_usd=gross * AAVE_FLASH_FEE * 0.1 if gross > 0 else 0,
+        safety_margin_usd=MIN_SAFETY_MARGIN_USD,
+        net_profit_usd=net,
+        status=CandidateStatus.CANDIDATE,
+        block_number=block_number,
+        quote_source=f"V3_{fee_buy}/V3_{fee_sell}",
+        confidence=0.8 if net > MIN_SAFETY_MARGIN_USD else 0.3,
+    )
+
+
+def _factory_name(factory: str) -> str:
+    """Return human-readable venue name from factory address."""
+    if factory == SUSHI_FACTORY:
+        return "SushiSwap"
+    elif factory == UNIV2_FACTORY:
+        return "UniswapV2"
+    elif factory == CAMELOT_FACTORY:
+        return "Camelot"
+    return factory[:10]
+
+
+def _symbol(token_addr: str) -> str:
+    """Return token symbol from address."""
+    addr = token_addr.lower()
+    if addr == WETH.lower():
+        return "WETH"
+    elif addr == USDC.lower():
+        return "USDC"
+    elif addr == USDCE.lower():
+        return "USDC.e"
+    return token_addr[:6]
+
+
+def _estimate_pool_liquidity(forward: List[Dict], reverse: List[Dict],
+                               eth_usd: float) -> float:
+    """
+    Estimate pool liquidity in USD from the best forward quote.
+    Uses the reserve data embedded in the quote to derive depth.
+    """
+    if not forward:
+        return 0.0
+    best = forward[0]
+    reserve_a = best.get("reserve_a", 0)
+    reserve_b = best.get("reserve_b", 0)
+    dec_a = best.get("token_a_decimals", 18)
+    dec_b = best.get("token_b_decimals", 18)
+    # Liquidity ≈ 2 × value of the WETH side in USD
+    eth_side = (reserve_a if WETH.lower() == best.get("token_a", "").lower()
+                else reserve_b)
+    eth_side_float = eth_side / (10 ** dec_a)
+    return 2 * eth_side_float * eth_usd
+
+
+def _safe_block_number(rpc: RPC) -> int:
+    """Safely get the current block number, return 0 on failure."""
+    try:
+        return rpc.eth_blockNumber()
+    except Exception:
+        return 0
+
+
+
 
 
 def _scan_v3_pools(rpc: RPC, eth_usd: float, gas_usd: float, size_wei: int) -> List[Dict[str, Any]]:

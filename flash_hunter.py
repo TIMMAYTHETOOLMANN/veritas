@@ -251,21 +251,28 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
     sized_edge_hint = controller.size_for_edge({}, gas_usd, eth_usd)
     target_trade_usd = sized_edge_hint.get("target_trade_usd", 0.0)
     try:
-        edges, report = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
-                                                    size_steps=12,
-                                                    max_venues_per_quote=8,
-                                                    use_multi_hop=True,
-                                                    use_parallel=True,
-                                                    target_trade_usd=target_trade_usd)
+        scan_result = arb_engine.scan_cross_venue(r, eth_usd, gas_usd,
+                                                  size_steps=12,
+                                                  max_venues_per_quote=8,
+                                                  use_multi_hop=True,
+                                                  use_parallel=True,
+                                                  target_trade_usd=target_trade_usd)
     except Exception as e:
         import traceback
         print(f"[hunter] registry scan failed: {e}", flush=True)
         traceback.print_exc()
         log_event({"event": "scan_error", "error": str(e)[:200]})
         return None
+    edges = scan_result.edges
+    report = scan_result.to_legacy_tuple()[1]
     if verbose:
         print(f"[{time.strftime('%H:%M:%S')}] cross-scan: {len(report)} combos, "
               f"{len(edges)} edges (ETH ${eth_usd:.0f})", flush=True)
+        # Print diagnostic report when no edges found
+        if not edges:
+            diag = scan_result.generate_why_zero_report()
+            print(diag, flush=True)
+            log_event({"event": "why_zero_report", "report": diag[:500]})
 
     if not edges:
         log_capital_state(controller, extra={"phase": "no_edges", "edges": 0, "passes": 0})
