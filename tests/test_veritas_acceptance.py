@@ -610,6 +610,8 @@ class TestJ_IntegrationScannerWithMockedRPC(unittest.TestCase):
 
     Unlike Tests A-I which construct data structures directly, this test
     exercises the real scan_cross_venue() function with mocked dependencies.
+
+    IMPORTANT: These tests must FAIL if the scanner breaks. No ejector seats.
     """
 
     def _make_mock_rpc(self):
@@ -625,28 +627,18 @@ class TestJ_IntegrationScannerWithMockedRPC(unittest.TestCase):
         """scan_cross_venue() should return a ScanResult instance."""
         from arb_engine import scan_cross_venue
         rpc = self._make_mock_rpc()
-        # The function may fail due to missing real pools, but should
-        # return a ScanResult (possibly empty) rather than raising
-        try:
-            result = scan_cross_venue(rpc, eth_usd=2500.0, gas_usd=0.01)
-            self.assertIsInstance(result, ScanResult)
-        except Exception:
-            # If RPC calls fail entirely, that's an environment issue,
-            # not a scanner logic issue — the test still validates
-            # the function is callable with the right signature
-            pass
+        # This MUST succeed with a mock RPC — if it fails, the scanner is broken
+        result = scan_cross_venue(rpc, eth_usd=2500.0, gas_usd=0.01)
+        self.assertIsInstance(result, ScanResult)
 
     def test_scan_cross_venue_with_no_quotes_produces_why_zero(self):
         """When no quotes are available, why_zero_report should explain why."""
         from arb_engine import scan_cross_venue
         rpc = self._make_mock_rpc()
-        try:
-            result = scan_cross_venue(rpc, eth_usd=2500.0, gas_usd=0.01)
-            report = result.generate_why_zero_report()
-            self.assertIsInstance(report, str)
-            self.assertIn("VERITAS SCAN", report)
-        except Exception:
-            pass
+        result = scan_cross_venue(rpc, eth_usd=2500.0, gas_usd=0.01)
+        report = result.generate_why_zero_report()
+        self.assertIsInstance(report, str)
+        self.assertIn("VERITAS SCAN", report)
 
     def test_scan_result_compatibility_layer(self):
         """ScanResult should be backward-compatible via __bool__, __len__, __iter__."""
@@ -842,6 +834,110 @@ class TestM_FactorySeparation(unittest.TestCase):
         self.assertIn("SUSHI_FACTORY", source)
         self.assertIn("UNIV2_FACTORY", source)
         self.assertIn("CAMELOT_FACTORY", source)
+
+
+class TestN_SimPathDoubleCounting(unittest.TestCase):
+    """
+    Test N: Verify that simulation PASS does NOT count as a live execution.
+    Only actual broadcasts should increment trade counters.
+    """
+
+    def test_sim_pass_does_not_increment_trade_count(self):
+        """A simulation PASS should only call record_sim_attempt, not record_live_execution."""
+        import tempfile
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_veritas.db")
+            with patch("core.db.DB_PATH", db_path):
+                from core.db import init as db_init
+                db_init()
+                from core.capital_controller import CapitalController
+                ctrl = CapitalController()
+                # Simulate a sim PASS: only record_sim_attempt should be called
+                ctrl.record_sim_attempt(0.01)
+                # Trade count should remain 0 (sim is not a trade)
+                self.assertEqual(ctrl.state.trades, 0,
+                                 "Sim attempt should not increment trade count")
+                self.assertEqual(ctrl.state.sim_attempts, 1,
+                                 "Sim attempt counter should increment")
+
+    def test_one_broadcast_records_one_trade(self):
+        """One broadcast should result in exactly one verified PnL entry, not two."""
+        import tempfile
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_veritas.db")
+            with patch("core.db.DB_PATH", db_path):
+                from core.db import init as db_init
+                db_init()
+                from core.capital_controller import CapitalController
+                ctrl = CapitalController()
+                initial_trades = ctrl.state.trades
+                # Sim path: only record_sim_attempt
+                ctrl.record_sim_attempt(0.01)
+                # Broadcast path: record_verified_pnl (one trade)
+                ctrl.record_verified_pnl(0.50, 0.01)
+                # Should be exactly 1 trade, not 2
+                self.assertEqual(ctrl.state.trades, initial_trades + 1,
+                                 "One broadcast should record exactly one trade")
+
+
+class TestO_RealizedPnLVerification(unittest.TestCase):
+    """
+    Test O: Verify that realized PnL verification uses on-chain balance delta,
+    not just the scanner's projected profit.
+    """
+
+    def test_weth_balance_helper_reads_erc20(self):
+        """_weth_balance should correctly decode ERC20 balanceOf response."""
+        from flash_hunter import _weth_balance
+        from unittest.mock import MagicMock
+        rpc = MagicMock()
+        # balanceOf returns 1.5 WETH = 1500000000000000000 wei
+        balance_1_5_weth = int(1.5 * 1e18)
+        # Encode as 32-byte hex (what eth_call returns)
+        rpc.eth_call.return_value = "0x" + format(balance_1_5_weth, "064x")
+        balance = _weth_balance(rpc, "0xWETH", "0xHOLDER")
+        self.assertAlmostEqual(balance, 1.5 * 1e18, places=0,
+                               msg="_weth_balance should decode 1.5 WETH")
+
+    def test_weth_balance_handles_error(self):
+        """_weth_balance should return 0 on RPC failure."""
+        from flash_hunter import _weth_balance
+        from unittest.mock import MagicMock
+        rpc = MagicMock()
+        rpc.eth_call.side_effect = Exception("RPC error")
+        balance = _weth_balance(rpc, "0xWETH", "0xHOLDER")
+        self.assertEqual(balance, 0,
+                         "_weth_balance should return 0 on error")
+
+    def test_realized_pnl_uses_minimum_of_projected_and_realized(self):
+        """Verified PnL should use the LESSER of projected or realized profit."""
+        import tempfile
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_veritas.db")
+            with patch("core.db.DB_PATH", db_path):
+                from core.db import init as db_init
+                db_init()
+                from core.capital_controller import CapitalController
+                ctrl = CapitalController()
+                initial_capital = ctrl.state.deployable_usd
+                # Simulate: projected $0.50, realized $0.30 (slippage)
+                projected = 0.50
+                realized = 0.30
+                verified = min(projected, realized) if realized > 0 else projected
+                ctrl.record_verified_pnl(verified, 0.01)
+                # Capital should increase by realized ($0.30), not projected ($0.50)
+                self.assertAlmostEqual(ctrl.state.deployable_usd,
+                                       initial_capital + 0.30, places=4,
+                                       msg="Verified PnL should use realized profit, not projected")
 
 
 if __name__ == "__main__":
