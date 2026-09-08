@@ -198,12 +198,13 @@ def _eth_usd_from_v2(rpc):
     return 2450.0  # hardcoded fallback
 
 
-def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
+def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True, controller=None):
     """One hunt cycle: registry cross-venue scan -> size -> gate -> broadcast."""
     cycle_start = time.time()
     # Capital controller for conservative micro-capital deployment.
-    from core.capital_controller import CapitalController
-    controller = CapitalController()
+    if controller is None:
+        from core.capital_controller import CapitalController
+        controller = CapitalController()
     sim_summary = {"attempts": 0, "passes": 0, "best_net_usd": None}
     # Prefer local fork for scanning if available; fall back to public
     # scan endpoints so read traffic does not depend on the broadcast fleet.
@@ -301,13 +302,13 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
         # non-V2 edge and every ZK failure. No opportunity is dropped.
         sim_results = simulate_edges_batch(edges, acct, executor_addr)
         for edge, sim in sim_results:
-            controller.record_attempt(gas_usd)
+            controller.record_sim_attempt(gas_usd)
             log_event({"event": "sim", "edge": edge, "sim": sim})
             sim_summary["attempts"] += 1
             if sim and sim.get("gate") == "PASS":
                 passes += 1
                 net = float(edge.get("net_margin", 0.0) or 0.0)
-                controller.record_result(net, gas_usd)
+                controller.record_live_execution(net, gas_usd, verified=False)
                 sim_summary["passes"] += 1
                 sim_summary["best_net_usd"] = net if sim_summary["best_net_usd"] is None else max(sim_summary["best_net_usd"], net)
                 log_capital_state(controller, extra={"phase": "sim_pass", "edge": edge})
@@ -317,12 +318,29 @@ def hunt_once(rpc, acct=None, executor_addr=None, rpc_scan=None, verbose=True):
         if passes and not DRY_RUN:
             pass_edge = next((e for e, s in sim_results
                               if s and s.get("gate") == "PASS"), None)
-            live_exec = load_executor()
+            live_exec = load_v2_executor()
             if pass_edge and live_exec:
-                tx = build_executor_tx(acct, live_exec, pass_edge)
-                receipt = broadcast_tx(rpc, acct, tx)
+                # CRITICAL: broadcast the EXACT calldata that the fork
+                # validated. build_executor_tx creates V1-format calldata
+                # (selector 0x5489b4f7) but the simulation validated
+                # V2-format calldata (_live_calldata). Sending the wrong
+                # format would revert or call the wrong function.
+                receipt = broadcast_v2_execution(rpc, acct, live_exec, pass_edge)
                 log_event({"event": "live_attempt", "executor": live_exec,
                            "receipt": receipt})
+                # After on-chain confirmation, record verified P/L
+                if receipt and receipt.get("broadcast") == "ok":
+                    verified_profit = float(pass_edge.get("net_margin", 0.0) or 0.0)
+                    controller.record_verified_pnl(verified_profit, gas_usd)
+                    log_capital_state(controller, extra={"phase": "verified_pnl", "tx": receipt.get("transactionHash", "")})
+                elif receipt and receipt.get("broadcast") == "reverted":
+                    # Transaction reverted on-chain — gas consumed, no profit
+                    controller.record_live_execution(0.0, gas_usd, verified=False)
+                    log_capital_state(controller, extra={"phase": "reverted_tx", "tx": receipt.get("transactionHash", "")})
+                elif receipt and receipt.get("broadcast") == "unconfirmed":
+                    # Receipt timeout — tx may or may not confirm; don't count as verified
+                    controller.record_live_execution(0.0, gas_usd, verified=False)
+                    log_capital_state(controller, extra={"phase": "reverted_tx", "tx": receipt.get("transactionHash", "")})
             elif pass_edge:
                 log_event({"event": "broadcast_skipped",
                            "reason": "no_executor"})
@@ -860,17 +878,21 @@ def main():
     if args.once:
         rpc, _ = get_rpc()
         executor_addr = load_executor()
-        hunt_once(rpc, acct, executor_addr, rpc.url)
+        from core.capital_controller import CapitalController
+        controller = CapitalController()
+        hunt_once(rpc, acct, executor_addr, rpc.url, controller=controller)
         return
 
     if args.run:
         last_heartbeat = 0
         print("[hunter] starting autonomous run loop", flush=True)
+        from core.capital_controller import CapitalController
+        controller = CapitalController()
         while True:
             try:
                 rpc, _ = get_rpc()
                 executor_addr = load_executor()
-                hunt_once(rpc, acct, executor_addr, rpc.url)
+                hunt_once(rpc, acct, executor_addr, rpc.url, controller=controller)
                 now = time.time()
                 if now - last_heartbeat >= HEARTBEAT_EVERY_SEC:
                     print(f"[{time.strftime('%H:%M:%S')}] heartbeat: wallet={acct.address} "

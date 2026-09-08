@@ -155,11 +155,15 @@ def discover_tokens_and_pairs(rpc: RPC) -> None:
                 try:
                     p = univ2_pair(rpc, factory, base, quote)
                     if p:
-                        pair_cache[(base, quote)] = p
-                        pair_cache[(quote, base)] = p
+                        # Key by factory to preserve multi-venue topology
+                        pair_cache[(factory, base, quote)] = p
+                        pair_cache[(factory, quote, base)] = p
+                        # Keep a default (first-found) entry for backward compatibility
+                        if (base, quote) not in pair_cache:
+                            pair_cache[(base, quote)] = p
+                            pair_cache[(quote, base)] = p
                         discovered_tokens[base] = seed_tokens[base]
                         discovered_tokens[quote] = seed_tokens[quote]
-                        break  # Found a pair for this base/quote, move on
                 except Exception:
                     pass
 
@@ -704,10 +708,8 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
         # Record all curve points as candidates
         if curve_result["size_curve"]:
             result.statistics["cross_venue_candidates"] += 1
-        elif forward and reverse:
-            # Quotes existed but all were same-factory — no cross-venue possible
-            result.record_rejection(RejectionReason.INVALID_PAIR)
 
+        if curve_result["size_curve"] and forward and reverse:
             # Build a candidate with the full size curve
             best_edge = curve_result.get("best_edge")
             if best_edge:
@@ -744,6 +746,9 @@ def scan_cross_venue(rpc: RPC, eth_usd: float, gas_usd: float, size_steps: int =
                     else:
                         candidate.reject(RejectionReason.SAFETY_MARGIN_REJECTION)
                         result.record_rejection(RejectionReason.SAFETY_MARGIN_REJECTION)
+        elif forward and reverse:
+            # Quotes existed but size curve was empty — no cross-venue opportunity
+            result.record_rejection(RejectionReason.INVALID_PAIR)
 
     # Scan V3 pools for arbitrage opportunities
     v3_edges = _scan_v3_pools(rpc, eth_usd, gas_usd, size_wei)
@@ -878,9 +883,15 @@ def _estimate_pool_liquidity(forward: List[Dict], reverse: List[Dict],
     dec_a = best.get("token_a_decimals", 18)
     dec_b = best.get("token_b_decimals", 18)
     # Liquidity ≈ 2 × value of the WETH side in USD
-    eth_side = (reserve_a if WETH.lower() == best.get("token_a", "").lower()
-                else reserve_b)
-    eth_side_float = eth_side / (10 ** dec_a)
+    if WETH.lower() == best.get("token_a", "").lower():
+        eth_side = reserve_a
+        eth_decimals = dec_a
+    elif WETH.lower() == best.get("token_b", "").lower():
+        eth_side = reserve_b
+        eth_decimals = dec_b
+    else:
+        return 0.0
+    eth_side_float = eth_side / (10 ** eth_decimals)
     return 2 * eth_side_float * eth_usd
 
 
