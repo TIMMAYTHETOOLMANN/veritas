@@ -1660,7 +1660,7 @@ class TestVeritasEngine(unittest.TestCase):
         engine = VeritasEngine()
         self.assertEqual(engine.config["discovery_interval_seconds"], 20)
         self.assertEqual(engine.config["chain_id"], 42161)
-        self.assertIn("gateway.tenderly.co", engine.config["rpc_urls"][0])
+        self.assertIn("alchemy", engine.config["rpc_urls"][0].lower())
 
     def test_engine_custom_config(self):
         """Engine should accept custom config."""

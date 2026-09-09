@@ -218,16 +218,58 @@ class PriceOracle:
         self, token_addr: str, stable_addr: str
     ) -> Tuple[Optional[float], float]:
         """
-        Compute token price via a stable pair using pool reserves.
-
-        Returns (price_usd, usd_liquidity) or (None, 0).
+        Compute token price via a stable pair using pool slot0 (sqrtPriceX96).
         """
-        from core.pool import PoolRegistry
-        # We need to find pools for this pair — use a simple approach
-        # In production, this would query the pool registry
-        # For now, return None to fall through to fallback
-        return None, 0.0
-
+        try:
+            # Known pools for common pairs on Arbitrum
+            KNOWN_POOLS = {
+                ("0x82af49447d8a07e3bd95bd0d56f35241523fbab1", "0xaf88d065e77c8cc2239327c5edb3a432268e5831"): [
+                    "0xc6962004f452be9203591991d15f6b388e09e8d0",
+                    "0x6f38e884725a116c9c7fbf208e79fe8828a2595f",
+                ],
+            }
+            
+            t0 = token_addr.lower()
+            t1 = stable_addr.lower()
+            
+            pools = None
+            for (a, b), addrs in KNOWN_POOLS.items():
+                if (t0 == a and t1 == b) or (t0 == b and t1 == a):
+                    pools = addrs
+                    break
+            
+            if not pools:
+                return None, 0.0
+            
+            for pool_addr in pools:
+                try:
+                    result = self.rpc.eth_call(pool_addr.lower(), "0x3850c7bd")
+                    if result and len(result) >= 66:
+                        sqrt_price_x96 = int(result[2:66], 16)
+                        if sqrt_price_x96 > 0:
+                            price_raw = (sqrt_price_x96 / (2**96))**2
+                            
+                            result_token0 = self.rpc.eth_call(pool_addr.lower(), "0x0dfe1681")
+                            if result_token0 and len(result_token0) >= 66:
+                                token0 = "0x" + result_token0[2:][-40:].lower()
+                                
+                                decimals0 = TOKEN_DECIMALS.get(token0, 18)
+                                decimals1 = TOKEN_DECIMALS.get(t0 if token0 != t0 else t1, 6)
+                                
+                                if token0 == t0:
+                                    price = price_raw * 10**(decimals0 - decimals1)
+                                else:
+                                    price = (1 / price_raw) * 10**(decimals1 - decimals0)
+                                
+                                if price > 0:
+                                    return price, price * 10**18
+                except Exception:
+                    continue
+            
+            return None, 0.0
+        except Exception:
+            return None, 0.0
+    
     def _get_block(self) -> int:
         """Get current block number, with error handling."""
         try:

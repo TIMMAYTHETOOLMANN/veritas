@@ -102,8 +102,19 @@ class PoolMetadata:
         return True
 
     def has_sufficient_liquidity(self, min_reserve_usd: float = 100.0) -> bool:
-        """Check if pool has sufficient liquidity to consider."""
-        return self.usd_depth >= min_reserve_usd and self.reserve0 > 0 and self.reserve1 > 0
+        """Check if pool has sufficient liquidity to consider.
+        
+        For V2 pools: check reserves (reserve0 > 0 AND reserve1 > 0)
+        For V3 pools: check liquidity > 0
+        """
+        if self.kind == "v3":
+            # V3 pools use liquidity, not reserves
+            return self.liquidity > 0 or self.usd_depth >= min_reserve_usd
+        else:
+            # V2 pools use reserves
+            has_reserves = self.reserve0 > 0 and self.reserve1 > 0
+            has_depth = self.usd_depth >= min_reserve_usd
+            return has_reserves or has_depth
 
     def to_dict(self) -> dict:
         return {
@@ -252,6 +263,11 @@ class PoolRegistry:
         """Get all live pools with sufficient liquidity."""
         return [p for p in self._pools.values()
                 if p.is_live and p.usd_depth >= min_usd_depth]
+
+    def get_pools_with_reserves(self) -> List[PoolMetadata]:
+        """Get pools that have non-zero reserves (actual on-chain liquidity)."""
+        return [p for p in self._pools.values()
+                if p.reserve0 > 0 and p.reserve1 > 0]
 
     def get_hot_pools(self, min_edge_count: int = 1) -> List[PoolMetadata]:
         """Get pools that have historically produced edges."""

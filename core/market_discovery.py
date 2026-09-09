@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from core.pool import PoolId, PoolMetadata, PoolRegistry
 from core.rpc import RPC
+from core.rpc_resilience import ResilientRPC
 
 
 # Known factory addresses on Arbitrum
@@ -92,6 +93,23 @@ def _parse_pool_addr(result: str) -> Optional[str]:
     return "0x" + tail.lower()
 
 
+# Rate limit error patterns
+_RATE_LIMIT_PATTERNS = [
+    "rate limit",
+    "usage limit",
+    "too many requests",
+    "429",
+    "throttled",
+    "quota exceeded",
+]
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    """Check if an error is a rate limit error."""
+    msg = str(error).lower()
+    return any(pattern in msg for pattern in _RATE_LIMIT_PATTERNS)
+
+
 class MarketDiscovery:
     """
     On-chain market discovery for VERITAS.
@@ -104,8 +122,9 @@ class MarketDiscovery:
         pools = discovery.discover_pools(tokens, venues=["uniswap_v3", "sushi"])
     """
 
-    def __init__(self, rpc: RPC, registry: PoolRegistry, chain_id: int = 42161):
+    def __init__(self, rpc: RPC, registry: PoolRegistry, chain_id: int = 42161, resilient_rpc: ResilientRPC = None):
         self.rpc = rpc
+        self.resilient_rpc = resilient_rpc
         self.registry = registry
         self.chain_id = chain_id
         self._stats = {
@@ -113,6 +132,7 @@ class MarketDiscovery:
             "pools_found": 0,
             "pools_registered": 0,
             "rpc_errors": 0,
+            "rate_limits": 0,
         }
 
     def discover_pools(
@@ -178,7 +198,8 @@ class MarketDiscovery:
                 "0x" + FACTORIES[venue]["selector"]
                 + _pad_addr(token_a) + _pad_addr(token_b) + _u256(fee)
             )
-            result = self.rpc.eth_call(factory, data)
+            rpc = self.resilient_rpc if self.resilient_rpc else self.rpc
+            result = rpc.eth_call(factory, data)
             pool_addr = _parse_pool_addr(result)
 
             if not pool_addr:
@@ -217,6 +238,8 @@ class MarketDiscovery:
 
         except Exception as e:
             self._stats["rpc_errors"] += 1
+            if _is_rate_limit_error(e):
+                self._stats["rate_limits"] += 1
             return None
 
     def _query_v2_pool(
@@ -232,7 +255,8 @@ class MarketDiscovery:
                 "0x" + FACTORIES[venue]["selector"]
                 + _pad_addr(token_a) + _pad_addr(token_b)
             )
-            result = self.rpc.eth_call(factory, data)
+            rpc = self.resilient_rpc if self.resilient_rpc else self.rpc
+            result = rpc.eth_call(factory, data)
             pool_addr = _parse_pool_addr(result)
 
             if not pool_addr:
@@ -271,6 +295,8 @@ class MarketDiscovery:
 
         except Exception as e:
             self._stats["rpc_errors"] += 1
+            if _is_rate_limit_error(e):
+                self._stats["rate_limits"] += 1
             return None
 
     def _safe_block(self) -> int:
@@ -279,6 +305,123 @@ class MarketDiscovery:
             return self.rpc.eth_blockNumber()
         except Exception:
             return 0
+
+    def fetch_reserves(self, pool: PoolMetadata) -> bool:
+        """
+        Fetch reserves for a pool from-chain.
+        
+        Args:
+            pool: The pool to fetch reserves for
+            
+        Returns:
+            True if reserves were successfully fetched
+        """
+        try:
+            if pool.kind == "v3":
+                # V3: slot0() returns sqrtPriceX96, tick, observationIndex, etc.
+                # and liquidity() returns the current liquidity
+                rpc = self.resilient_rpc if self.resilient_rpc else self.rpc
+                result = rpc.eth_call(pool.pool_id.pool_address, "0x1a686502")  # liquidity()
+                if result and len(result) >= 66:
+                    pool.liquidity = int(result[2:66], 16)
+                
+                # V3 doesn't have simple reserves, but we can use liquidity as proxy
+                # For now, mark as having liquidity if liquidity > 0
+                if pool.liquidity > 0:
+                    pool.reserve1 = pool.liquidity  # Use liquidity as proxy
+                    pool.reserve0 = 1  # Mark as having reserves
+                    pool.is_live = True
+                    return True
+                    
+            else:
+                # V2: getReserves() returns (reserve0, reserve1, blockTimestampLast)
+                rpc = self.resilient_rpc if self.resilient_rpc else self.rpc
+                result = rpc.eth_call(pool.pool_id.pool_address, "0x0902f1ac")  # getReserves()
+                if result and len(result) >= 66:
+                    reserve0 = int(result[2:66], 16)
+                    reserve1 = int(result[66:130], 16) if len(result) >= 130 else 0
+                    pool.reserve0 = reserve0
+                    pool.reserve1 = reserve1
+                    pool.is_live = reserve0 > 0 and reserve1 > 0
+                    return pool.is_live
+                    
+        except Exception as e:
+            self._stats["rpc_errors"] += 1
+            if _is_rate_limit_error(e):
+                self._stats["rate_limits"] += 1
+        
+        return False
+
+    def _query_pool_address(self, venue: str, factory_info: dict,
+                            token_a: str, token_b: str, fee_tiers: Optional[List[int]] = None) -> Optional[str]:
+        """Query factory for pool address (without registering)."""
+        try:
+            if factory_info["kind"] == "v3":
+                fee_tiers = fee_tiers or V3_FEE_TIERS
+                for fee in fee_tiers:
+                    data = (
+                        "0x" + factory_info["selector"]
+                        + _pad_addr(token_a) + _pad_addr(token_b) + _u256(fee)
+                    )
+                    rpc = self.resilient_rpc if self.resilient_rpc else self.rpc
+                    result = rpc.eth_call(factory_info["address"], data)
+                    addr = _parse_pool_addr(result)
+                    if addr:
+                        return addr
+            else:
+                data = (
+                    "0x" + factory_info["selector"]
+                    + _pad_addr(token_a) + _pad_addr(token_b)
+                )
+                rpc = self.resilient_rpc if self.resilient_rpc else self.rpc
+                result = rpc.eth_call(factory_info["address"], data)
+                return _parse_pool_addr(result)
+        except Exception:
+            pass
+        return None
+
+    def discover_and_refresh(self, tokens: List[str], venues: Optional[List[str]] = None,
+                            fee_tiers: Optional[List[int]] = None) -> List[PoolMetadata]:
+        """
+        Discover pools AND fetch their reserves.
+        
+        Also fetches reserves for existing pools that have zero reserves.
+        
+        Returns:
+            List of all discovered pools (reserve fetch failures are non-fatal)
+        """
+        # First discover pool addresses (new pools)
+        discovered = self.discover_pools(tokens, venues, fee_tiers)
+        
+        # Also find existing pools with zero reserves that need refreshing
+        existing_pools_needing_reserves = []
+        if venues is None:
+            venues = list(FACTORIES.keys())
+        
+        for venue_name in venues:
+            factory_info = FACTORIES.get(venue_name)
+            if not factory_info:
+                continue
+            for i, token_a in enumerate(tokens):
+                for token_b in tokens[i + 1:]:
+                    # Check if pool exists for this pair
+                    pool_addr = self._query_pool_address(venue_name, factory_info, token_a, token_b, fee_tiers)
+                    if pool_addr:
+                        existing = self.registry.get_by_address(self.chain_id, pool_addr)
+                        if existing and (existing.reserve0 == 0 and existing.reserve1 == 0):
+                            existing_pools_needing_reserves.append(existing)
+        
+        # Fetch reserves for all pools (new + existing)
+        all_pools = discovered + existing_pools_needing_reserves
+        pools_with_reserves = 0
+        for pool in all_pools:
+            if self.fetch_reserves(pool):
+                pools_with_reserves += 1
+                # Persist the updated pool (with reserves) to the database
+                self.registry.register(pool, persist=True)
+        
+        self._stats["pools_with_reserves"] = pools_with_reserves
+        return all_pools
 
     def stats(self) -> dict:
         """Return discovery statistics."""

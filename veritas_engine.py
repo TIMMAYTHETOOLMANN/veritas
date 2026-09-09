@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.pool import PoolId, PoolMetadata, PoolRegistry
 from core.market_discovery import MarketDiscovery
 from core.price_oracle import PriceOracle, PricePoint
-from core.quote_engine import QuoteEngine, QuoteResult
+from core.quote_engine_v2 import QuoteEngine, QuoteResult
 from core.economic_model import EconomicModel, EconomicResult
 from core.size_optimizer import SizeOptimizer, SizeCurve
 from core.route_generator import RouteGenerator, Route
@@ -40,6 +40,8 @@ from core.opportunity_telemetry import Candidate, CandidateStatus, RejectionReas
 from core.error_taxonomy import ErrorTaxonomy, ErrorCode, ClassifiedError
 from core.capital_controller import CapitalController, CapitalMode
 from core.rpc import RPC
+from core.rpc_resilience import ResilientRPC, RPCCache
+from core.external_apis import AlchemyRPC, CryptoArbitrageAPI, DeFiLlamaAPI
 
 
 # ---- Default configuration ----
@@ -60,9 +62,9 @@ DEFAULT_CONFIG = {
     "live_execution_enabled": False,
     "micro_capital_mode": True,
     "rpc_urls": [
+        "https://arb-mainnet.g.alchemy.com/v2/alch_VNgR_d3fLq-3WDpDb7_Ol",
         "https://gateway.tenderly.co/public/arbitrum",
         "https://arbitrum.drpc.org",
-        "https://arbitrum.publicnode.com",
     ],
 }
 
@@ -108,6 +110,10 @@ class VeritasEngine:
 
         # Initialize components
         self.rpc_health = RPCHealthMonitor(self.config["rpc_urls"])
+        self.resilient_rpc = ResilientRPC(
+            [(url, i) for i, url in enumerate(self.config["rpc_urls"])],
+            cache=RPCCache()
+        )
         self.pool_registry = PoolRegistry()
         self.quote_engine: Optional[QuoteEngine] = None
         self.price_oracle: Optional[PriceOracle] = None
@@ -115,6 +121,9 @@ class VeritasEngine:
         self.size_optimizer: Optional[SizeOptimizer] = None
         self.route_generator = RouteGenerator(self.pool_registry)
         self.market_discovery: Optional[MarketDiscovery] = None
+        self.alchemy: Optional[AlchemyRPC] = None
+        self.arbitrage_api: Optional[CryptoArbitrageAPI] = None
+        self.defillama_api: Optional[DeFiLlamaAPI] = None
         self.accounting = AccountingLedger()
         self.capital_controller = CapitalController()
 
@@ -151,6 +160,9 @@ class VeritasEngine:
         # Initialize components that need RPC
         self.quote_engine = QuoteEngine(rpc)
         self.market_discovery = MarketDiscovery(rpc, self.pool_registry, self.chain_id)
+        self.alchemy = AlchemyRPC()
+        self.arbitrage_api = CryptoArbitrageAPI()
+        self.defillama_api = DeFiLlamaAPI()
         self.price_oracle = PriceOracle(rpc)
         self.economic_model = EconomicModel(self.price_oracle)
         self.size_optimizer = SizeOptimizer(self.price_oracle)
@@ -217,14 +229,65 @@ class VeritasEngine:
             block = self._safe_block(rpc)
             result.scan_metadata = {"block_number": block, "cycle": self._cycle_count}
 
-            # Update quote engine with current RPC
-            self.quote_engine = QuoteEngine(rpc)
+            # Update quote engine with resilient RPC
+            self.quote_engine = QuoteEngine(rpc, self.resilient_rpc)
             self.price_oracle = PriceOracle(rpc)
             self.economic_model = EconomicModel(self.price_oracle)
 
-            # Phase 1: Discovery — get pools to scan
-            pools = self._get_scan_pools()
+            # Phase 1: Discovery -- query chain for pools
+            # Run discovery if no pools have actual reserves
+            pools_with_reserves = self.pool_registry.get_pools_with_reserves()
+            needs_discovery = len(pools_with_reserves) < 2
+            
+            if needs_discovery:
+                # Discover pools with RPC failover
+                discovered = []
+                discovery_stats = {"rate_limits": 0, "rpc_errors": 0}
+                healthy_urls = self.rpc_health.get_healthy_urls()
+                
+                for url in healthy_urls:
+                    from core.rpc import RPC
+                    rpc_disc = RPC(url, timeout=30, retries=1)
+                    self.market_discovery = MarketDiscovery(
+                        rpc_disc, self.pool_registry, self.chain_id,
+                        resilient_rpc=self.resilient_rpc
+                    )
+                    discovered = self.market_discovery.discover_and_refresh(
+                        self._hot_tokens,  # All hot tokens
+                        venues=["uniswap_v3", "sushi_v3", "camelot", "uniswap_v2", "sushi"],
+                        fee_tiers=[100, 500, 3000, 10000],  # All fee tiers
+                    )
+                    discovery_stats = self.market_discovery.stats()
+                    if discovered:
+                        break
+                
+                stats["pools_discovered"] = len(discovered)
+                stats["discovery_rate_limits"] = discovery_stats.get("rate_limits", 0)
+                print(f"[DEBUG] Discovery: {len(discovered)} pools, stats={discovery_stats}", flush=True)
+            else:
+                stats["pools_discovered"] = 0
+            
+            # Get all pools for scanning
+            pools = self.pool_registry.get_live_pools(min_usd_depth=0)
             stats["pools_seen"] = len(pools)
+
+            # For V3 pools, verify activity via slot0() instead of reserves
+            v3_pools_needing_verify = [p for p in pools if p.kind == "v3" and p.liquidity == 0]
+            print(f"[DEBUG] V3 pools needing verify: {len(v3_pools_needing_verify)}", flush=True)
+            if v3_pools_needing_verify:
+                for pool in v3_pools_needing_verify:
+                    try:
+                        slot0 = self.resilient_rpc.eth_call(pool.pool_id.pool_address, "0x3850c7bd")
+                        if slot0 and len(slot0) >= 66:
+                            sqrt_px = int(slot0[2:66], 16)
+                            if sqrt_px > 0:
+                                pool.liquidity = 1  # Mark as active
+                                self.pool_registry.register(pool, persist=True)
+                                stats["pools_refreshed"] = stats.get("pools_refreshed", 0) + 1
+                    except Exception as e:
+                        print(f"[DEBUG] Verify failed: {str(e)[:60]}", flush=True)
+                        continue
+
 
             # Phase 2: Route generation
             routes = self.route_generator.generate_all_routes(
@@ -381,6 +444,8 @@ class VeritasEngine:
                 first_step.token_in, first_step.token_out, amount_in, pool
             )
 
+            print(f"[DEBUG] Quote {first_step.token_in[:6]}->{first_step.token_out[:6]}: success={quote.success}, out={quote.amount_out}, error={quote.error}", flush=True)
+
             if not quote.is_valid:
                 stats["quotes_failed"] += 1
                 candidate.reject(RejectionReason.NO_QUOTE)
@@ -533,6 +598,9 @@ class VeritasEngine:
             "rpc_health": self.rpc_health.status(),
             "capital": self.capital_controller.summary(),
             "accounting": self.accounting.summary(),
+            "alchemy": self.alchemy.stats() if self.alchemy else None,
+            "arbitrage_api": self.arbitrage_api.stats() if self.arbitrage_api else None,
+            "defillama_api": self.defillama_api.stats() if self.defillama_api else None,
             "config": {k: v for k, v in self.config.items() if "secret" not in k.lower()},
         }
 
