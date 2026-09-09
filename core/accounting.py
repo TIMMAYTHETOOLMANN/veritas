@@ -53,6 +53,7 @@ class ExecutionRecord:
     verified_profit_usd: float = 0.0
     gas_native: float = 0.0
     gas_usd: float = 0.0
+    gas_already_in_delta: bool = True
     created_at: int = 0
     verified_at: int = 0
 
@@ -69,6 +70,7 @@ class ExecutionRecord:
             "verified_profit_usd": round(self.verified_profit_usd, 6),
             "gas_native": round(self.gas_native, 8),
             "gas_usd": round(self.gas_usd, 6),
+            "gas_already_in_delta": self.gas_already_in_delta,
             "created_at": self.created_at,
             "verified_at": self.verified_at,
         }
@@ -88,7 +90,7 @@ class AccountingLedger:
         self._ensure_tables()
 
     def _ensure_tables(self):
-        """Ensure accounting tables exist."""
+        """Ensure accounting tables exist, with migration for new columns."""
         c = conn()
         try:
             c.executescript("""
@@ -110,6 +112,10 @@ class AccountingLedger:
                 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
                 CREATE INDEX IF NOT EXISTS idx_executions_block ON executions(block_number);
             """)
+            # Migration: add gas_already_in_delta column if missing (existing DBs)
+            cols = [r[1] for r in c.execute("PRAGMA table_info(executions)").fetchall()]
+            if "gas_already_in_delta" not in cols:
+                c.execute("ALTER TABLE executions ADD COLUMN gas_already_in_delta INTEGER DEFAULT 1")
             c.commit()
         finally:
             c.close()
@@ -133,13 +139,15 @@ class AccountingLedger:
                 INSERT INTO executions (
                     tx_hash, chain_id, block_number, route_id, candidate_id,
                     status, projected_profit_usd, realized_profit_usd,
-                    verified_profit_usd, gas_native, gas_usd, created_at, verified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    verified_profit_usd, gas_native, gas_usd, gas_already_in_delta,
+                    created_at, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.tx_hash, record.chain_id, record.block_number,
                 record.route_id, record.candidate_id, record.status,
                 record.projected_profit_usd, record.realized_profit_usd,
                 record.verified_profit_usd, record.gas_native, record.gas_usd,
+                int(record.gas_already_in_delta),
                 record.created_at, record.verified_at,
             ))
             c.commit()
@@ -168,6 +176,17 @@ class AccountingLedger:
           Else:
             verified_profit = realized_profit_usd - gas_usd
 
+        CRITICAL: summary() must NOT subtract gas again from verified_profit_usd.
+        """
+        """
+        Verify an execution with on-chain data.
+
+        ACCOUNTING EQUATION:
+          If gas_already_in_delta (typical for flash-loan arb):
+            verified_profit = realized_profit_usd
+          Else:
+            verified_profit = realized_profit_usd - gas_usd
+
         Returns the updated record, or None if tx_hash not found.
         """
         record = self.get_execution(tx_hash)
@@ -181,6 +200,7 @@ class AccountingLedger:
         record.verified_at = now()
 
         # Apply accounting equation
+        record.gas_already_in_delta = gas_already_in_delta
         if gas_already_in_delta:
             record.verified_profit_usd = realized_profit_usd
         else:
@@ -330,7 +350,12 @@ class AccountingLedger:
                 "pending": pending,
                 "total_verified_profit_usd": round(total_profit, 6),
                 "total_gas_usd": round(total_gas, 6),
-                "net_profit_usd": round(total_profit - total_gas, 6),
+                "net_profit_usd": round(total_profit, 6),
+                # IMPORTANT: net_profit = SUM(verified_profit_usd)
+                # verified_profit_usd ALREADY accounts for gas correctly:
+                #   - If gas_already_in_delta=True: verified = realized (gas included in delta)
+                #   - If gas_already_in_delta=False: verified = realized - gas
+                # NEVER subtract gas again here.
             }
         finally:
             c.close()
@@ -343,12 +368,14 @@ class AccountingLedger:
                 UPDATE executions SET
                     block_number = ?, status = ?,
                     realized_profit_usd = ?, verified_profit_usd = ?,
-                    gas_native = ?, gas_usd = ?, verified_at = ?
+                    gas_native = ?, gas_usd = ?, gas_already_in_delta = ?,
+                    verified_at = ?
                 WHERE tx_hash = ?
             """, (
                 record.block_number, record.status,
                 record.realized_profit_usd, record.verified_profit_usd,
-                record.gas_native, record.gas_usd, record.verified_at,
+                record.gas_native, record.gas_usd,
+                int(record.gas_already_in_delta), record.verified_at,
                 record.tx_hash,
             ))
             c.commit()

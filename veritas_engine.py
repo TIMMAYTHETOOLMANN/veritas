@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.pool import PoolId, PoolMetadata, PoolRegistry
+from core.market_discovery import MarketDiscovery
 from core.price_oracle import PriceOracle, PricePoint
 from core.quote_engine import QuoteEngine, QuoteResult
 from core.economic_model import EconomicModel, EconomicResult
@@ -113,6 +114,7 @@ class VeritasEngine:
         self.economic_model: Optional[EconomicModel] = None
         self.size_optimizer: Optional[SizeOptimizer] = None
         self.route_generator = RouteGenerator(self.pool_registry)
+        self.market_discovery: Optional[MarketDiscovery] = None
         self.accounting = AccountingLedger()
         self.capital_controller = CapitalController()
 
@@ -148,6 +150,7 @@ class VeritasEngine:
 
         # Initialize components that need RPC
         self.quote_engine = QuoteEngine(rpc)
+        self.market_discovery = MarketDiscovery(rpc, self.pool_registry, self.chain_id)
         self.price_oracle = PriceOracle(rpc)
         self.economic_model = EconomicModel(self.price_oracle)
         self.size_optimizer = SizeOptimizer(self.price_oracle)

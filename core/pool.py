@@ -177,8 +177,14 @@ class PoolRegistry:
         finally:
             c.close()
 
-    def register(self, pool: PoolMetadata) -> None:
-        """Register or update a pool in the registry."""
+    def register(self, pool: PoolMetadata, persist: bool = True) -> None:
+        """Register or update a pool in the registry.
+        
+        Args:
+            pool: The pool to register
+            persist: If True (default), persist to database.
+                     Set to False when loading from database to avoid write loop.
+        """
         key = pool.unique_key
         self._pools[key] = pool
 
@@ -196,8 +202,9 @@ class PoolRegistry:
         if key not in self._by_venue[venue]:
             self._by_venue[venue].append(key)
 
-        # Persist
-        self._persist(pool)
+        # Persist (skip when loading from DB to avoid write loop)
+        if persist:
+            self._persist(pool)
 
     def get(self, pool_id: PoolId) -> Optional[PoolMetadata]:
         """Get pool metadata by pool identity."""
@@ -325,7 +332,7 @@ class PoolRegistry:
                     historical_edge_count=row["historical_edge_count"],
                     last_edge_timestamp=row["last_edge_timestamp"],
                 )
-                self.register(pool)
+                self.register(pool, persist=False)
                 count += 1
             return count
         finally:
