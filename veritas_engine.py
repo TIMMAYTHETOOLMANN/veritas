@@ -42,6 +42,22 @@ from core.capital_controller import CapitalController, CapitalMode
 from core.rpc import RPC
 from core.rpc_resilience import ResilientRPC, RPCCache
 from core.external_apis import AlchemyRPC, CryptoArbitrageAPI, DeFiLlamaAPI
+from core.mev_inspector import (
+    MEVType,
+    ArbitrageOpportunity,
+    LiquidationOpportunity,
+    SandwichOpportunity,
+    BlockProcessor,
+    MEVTracker,
+)
+from core.mev_inspector import (
+    MEVType,
+    ArbitrageOpportunity,
+    LiquidationOpportunity,
+    SandwichOpportunity,
+    BlockProcessor,
+    MEVTracker,
+)
 
 
 # ---- Default configuration ----
@@ -54,7 +70,7 @@ DEFAULT_CONFIG = {
     "heartbeat_seconds": 10,
     "max_scan_duration_seconds": 15,
     "max_hops": 3,
-    "max_routes_per_token": 50,
+    "max_routes_per_token": 500,
     "min_profit_usd": 0.01,
     "max_gas_usd": 1.00,
     "max_slippage_bps": 50,
@@ -136,6 +152,15 @@ class VeritasEngine:
         )
         self.execution_gate = ExecutionGate(gate_config, self.rpc_health)
 
+        # MEV Inspection
+        self.mev_tracker = MEVTracker()
+        self.block_processor = BlockProcessor(
+            rpc=None,  # Will be set during scan
+            resilient_rpc=self.resilient_rpc,
+            price_oracle=self.price_oracle,
+            registry=self.pool_registry,
+        )
+
         # State
         self._cycle_count = 0
         self._running = False
@@ -175,6 +200,26 @@ class VeritasEngine:
         health = self.rpc_health.health_check()
         healthy_count = sum(1 for v in health.values() if v)
         print(f"[VERITAS] RPC health: {healthy_count}/{len(health)} endpoints healthy", flush=True)
+
+        # Initialize MEV components
+        from core.mev_inspector import (
+            ArbitrageDetector,
+            LiquidationDetector,
+            SandwichDetector,
+            BlockProcessor,
+            MEVTracker,
+        )
+        self.arbitrage_detector = ArbitrageDetector(rpc, self.resilient_rpc, self.price_oracle)
+        self.liquidation_detector = LiquidationDetector(rpc, self.resilient_rpc, self.price_oracle)
+        self.sandwich_detector = SandwichDetector(rpc, self.resilient_rpc)
+        self.block_processor = BlockProcessor(
+            self.arbitrage_detector,
+            self.liquidation_detector,
+            self.sandwich_detector,
+        )
+        
+        # Update tracker reference
+        self.mev_tracker = MEVTracker()
 
         # Verify price oracle
         eth_price = self.price_oracle.get_price_usd(CORE_TOKENS[0])
@@ -235,9 +280,14 @@ class VeritasEngine:
             self.economic_model = EconomicModel(self.price_oracle)
 
             # Phase 1: Discovery -- query chain for pools
-            # Run discovery if no pools have actual reserves
+            # Run discovery on first scan or if registry is stale
+            # Discovery runs every N scans to refresh market state
             pools_with_reserves = self.pool_registry.get_pools_with_reserves()
-            needs_discovery = len(pools_with_reserves) < 2
+            needs_discovery = (
+                self._cycle_count == 1 or  # First scan
+                len(pools_with_reserves) < 10 or  # Too few pools
+                self._cycle_count % 10 == 0  # Refresh every 10 scans
+            )
             
             if needs_discovery:
                 # Discover pools with RPC failover
@@ -296,8 +346,8 @@ class VeritasEngine:
             routes = self.route_generator.rank_routes(routes)
             stats["routes_generated"] = len(routes)
 
-            # Phase 3: Evaluate routes
-            for route in routes[:self.config["max_routes_per_token"]]:
+            # Phase 3: Evaluate routes (quote ALL generated routes)
+            for route in routes:
                 candidate = self._evaluate_route(route, rpc, stats)
                 if candidate:
                     result.candidates.append(candidate)
@@ -326,6 +376,35 @@ class VeritasEngine:
             for candidate in result.candidates:
                 if candidate.rejection_reason:
                     result.record_rejection(candidate.rejection_reason)
+
+            # Phase 5: MEV Detection - analyze current block for MEV opportunities
+            if block > 0 and self.block_processor:
+                try:
+                    mev_results = self.block_processor.process_block(block)
+                    
+                    # Track MEV opportunities
+                    for mev_type, opportunities in mev_results.items():
+                        self.mev_tracker.add_opportunities(mev_type, opportunities)
+                    
+                    # Add MEV stats to result
+                    stats["mev_arbitrages"] = len(mev_results.get(MEVType.ARBITRAGE, []))
+                    stats["mev_liquidations"] = len(mev_results.get(MEVType.LIQUIDATION, []))
+                    stats["mev_sandwiches"] = len(mev_results.get(MEVType.SANDWICH, []))
+                    
+                    # Add top MEV opportunities to result metadata
+                    top_mev = self.mev_tracker.get_top_opportunities(10)
+                    result.scan_metadata["mev_opportunities"] = [
+                        {
+                            "type": opp.__class__.__name__.replace("Opportunity", "").lower(),
+                            "block": opp.block_number,
+                            "profit_usd": opp.profit_usd,
+                            "tx_hash": getattr(opp, "tx_hash", ""),
+                        }
+                        for opp in top_mev
+                    ]
+                except Exception as e:
+                    # Don't let MEV detection failures break the scan
+                    pass
 
         except Exception as e:
             err = ErrorTaxonomy.classify(e, block_number=0)
@@ -591,6 +670,7 @@ class VeritasEngine:
 
     def status(self) -> dict:
         """Get engine status."""
+        mev_summary = self.mev_tracker.get_summary() if self.mev_tracker else {}
         return {
             "cycle": self._cycle_count,
             "running": self._running,
@@ -598,6 +678,7 @@ class VeritasEngine:
             "rpc_health": self.rpc_health.status(),
             "capital": self.capital_controller.summary(),
             "accounting": self.accounting.summary(),
+            "mev": mev_summary,
             "alchemy": self.alchemy.stats() if self.alchemy else None,
             "arbitrage_api": self.arbitrage_api.stats() if self.arbitrage_api else None,
             "defillama_api": self.defillama_api.stats() if self.defillama_api else None,
