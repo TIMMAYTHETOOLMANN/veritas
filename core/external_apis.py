@@ -36,15 +36,17 @@ class AlchemyRPC:
         result = rpc.eth_call(address, data)
     """
     
-    def __init__(self, api_key: str = ALCHEMY_KEY, chain: str = "arbitrum"):
-        self.api_key = api_key
-        self.chain = chain
-        if chain == "arbitrum":
-            self.url = f"https://arb-mainnet.g.alchemy.com/v2/{api_key}"
-        else:
-            self.url = f"https://eth-mainnet.g.alchemy.com/v2/{api_key}"
-        self._request_count = 0
-        self._error_count = 0
+    def __init__(self, api_key: str = None, chain: str = "arbitrum"):
+            if api_key is None:
+                api_key = os.getenv("ALCHEMY_ARBITRUM_URL", "")
+            self.api_key = api_key
+            self.chain = chain
+            if chain == "arbitrum":
+                self.url = f"https://arb-mainnet.g.alchemy.com/v2/{api_key}" if api_key else ""
+            else:
+                self.url = f"https://eth-mainnet.g.alchemy.com/v2/{api_key}" if api_key else ""
+            self._request_count = 0
+            self._error_count = 0
     
     def _call(self, method: str, params: list) -> Any:
         """Make a JSON-RPC call."""
