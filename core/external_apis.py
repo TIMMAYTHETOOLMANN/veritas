@@ -19,10 +19,9 @@ from typing import Any, Dict, List, Optional
 
 # ---- Configuration ----
 
-ALCHEMY_KEY = "alch_VNgR_d3fLq-3WDpDb7_Ol"
-ALCHEMY_ARBITRUM_URL = f"https://arb-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
-
-RAPIDAPI_KEY = "6af8fc9ed1msh37b65cbd5a9ba15p1c05a6jsn52c4beedb930"
+import os
+ALCHEMY_ARBITRUM_URL = os.getenv("ALCHEMY_ARBITRUM_URL", "")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 
 
 # ---- Alchemy RPC ----

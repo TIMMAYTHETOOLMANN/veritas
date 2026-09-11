@@ -151,10 +151,10 @@ def test_quoterv2_with_resilient_rpc():
     print("=" * 60)
     
     providers = [
-        ("https://arb-mainnet.g.alchemy.com/v2/alch_VNgR_d3fLq-3WDpDb7_Ol", 0),
-        ("https://gateway.tenderly.co/public/arbitrum", 1),
-        ("https://arbitrum.drpc.org", 2),
-    ]
+            (os.getenv("ALCHEMY_ARBITRUM_URL", ""), 0),
+            ("https://gateway.tenderly.co/public/arbitrum", 1),
+            ("https://arbitrum.drpc.org", 2),
+        ]
     
     resilient_rpc = ResilientRPC(providers, cache=RPCCache())
     

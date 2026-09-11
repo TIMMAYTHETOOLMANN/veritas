@@ -76,10 +76,10 @@ DEFAULT_CONFIG = {
     "live_execution_enabled": False,
     "micro_capital_mode": True,
     "rpc_urls": [
-        "https://arb-mainnet.g.alchemy.com/v2/alch_VNgR_d3fLq-3WDpDb7_Ol",
-        "https://gateway.tenderly.co/public/arbitrum",
-        "https://arbitrum.drpc.org",
-    ],
+            os.getenv("ALCHEMY_ARBITRUM_URL", ""),
+            "https://gateway.tenderly.co/public/arbitrum",
+            "https://arbitrum.drpc.org",
+        ],
 }
 
 # Core tokens (Tier 1 — always scan)
