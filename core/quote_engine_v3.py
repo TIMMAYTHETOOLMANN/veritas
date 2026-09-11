@@ -214,9 +214,13 @@ class V3SpotPriceAdapter:
             else:
                 price_adjusted = (1 / price) * 10**(decimals_out - decimals_in)
             
-            # Apply pool fee
-            fee_bps = pool.fee
-            amount_out_float = (amount_in / 10**decimals_in) * price_adjusted * (1 - fee_bps / 10000)
+            # Apply pool fee.
+            # pool.fee is in "hundredths of a bip" (e.g. 3000 = 0.3%, 500 = 0.05%).
+            # The fee fraction is pool.fee / 1_000_000, NOT / 10000.
+            # Using / 10000 would treat pool.fee = 500 as 5% fee instead of 0.05%.
+            # Correct: 500 / 1_000_000 = 0.0005 = 0.05%.
+            fee_fraction = pool.fee / 1_000_000
+            amount_out_float = (amount_in / 10**decimals_in) * price_adjusted * (1 - fee_fraction)
             amount_out = int(amount_out_float * 10**decimals_out)
             
             return amount_out if amount_out > 0 else None

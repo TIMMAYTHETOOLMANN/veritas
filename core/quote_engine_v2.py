@@ -43,6 +43,8 @@ class QuoteResult:
     block_number: int = 0
     quote_latency_ms: float = 0.0
     confidence: float = 0.0
+    source: str = ""            # "quoter_v2" | "spot_fallback" | "v2_constant_product"
+    authoritative: bool = False  # execution-eligible only when True
     success: bool = False
     error: Optional[str] = None
 
@@ -69,6 +71,8 @@ class QuoteResult:
             "block_number": self.block_number,
             "quote_latency_ms": self.quote_latency_ms,
             "confidence": self.confidence,
+            "source": self.source,
+            "authoritative": self.authoritative,
             "success": self.success,
         }
 
@@ -105,10 +109,15 @@ class V2QuoteAdapter:
                 result.error = "zero reserves"
                 return result
 
-            # V2 formula with 0.3% fee (997/1000)
-            amount_in_with_fee = amount_in * 997
-            numerator = amount_in_with_fee * reserve_out
-            denominator = (reserve_in * 1000) + amount_in_with_fee
+            # V2 constant product formula with pool-specific fee.
+            # pool.fee is in "hundredths of a bip" (e.g. 3000 = 0.3%, 2500 = 0.25%).
+            # The keep-ratio is (1_000_000 - pool.fee) / 1_000_000, so the generalized formula is:
+            #   amount_out = (amount_in * (1_000_000 - pool.fee) * reserve_out) //
+            #                (reserve_in * 1_000_000 + amount_in * (1_000_000 - pool.fee))
+            # This reduces to the original 997/1000 when pool.fee = 3000.
+            adjusted_in = amount_in * (1_000_000 - pool.fee)
+            numerator = adjusted_in * reserve_out
+            denominator = reserve_in * 1_000_000 + adjusted_in
             amount_out = numerator // denominator
 
             if amount_out <= 0:
@@ -125,6 +134,8 @@ class V2QuoteAdapter:
 
             result.amount_out = amount_out
             result.gas_estimate = 150_000
+            result.source = "v2_constant_product"
+            result.authoritative = True  # exact formula on reserves, not estimation
             result.success = True
             result.confidence = 0.9
 
@@ -169,6 +180,8 @@ class V3QuoteAdapter:
             if amount_out and amount_out > 0:
                 result.amount_out = amount_out
                 result.gas_estimate = 250_000
+                result.source = "quoter_v2"
+                result.authoritative = True  # on-chain exact quote: execution-eligible
                 result.success = True
                 result.confidence = 0.95  # High confidence - on-chain quote
             else:
@@ -177,6 +190,8 @@ class V3QuoteAdapter:
                 if amount_out and amount_out > 0:
                     result.amount_out = amount_out
                     result.gas_estimate = 250_000
+                    result.source = "spot_fallback"
+                    result.authoritative = False  # estimation only: NEVER execution-eligible
                     result.success = True
                     result.confidence = 0.70  # Lower confidence - estimation
                 else:

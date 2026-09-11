@@ -46,6 +46,12 @@ class RejectionReason(Enum):
     SIMULATION_REJECTION = "simulation_rejection"
     EXECUTION_RISK_REJECTION = "execution_risk_rejection"
     NO_OPPORTUNITY = "no_opportunity"  # genuinely efficient market
+    MALFORMED_ROUTE = "malformed_route"  # shape/closure/continuity violation
+    NO_POOL_FOR_STEP = "no_pool_for_step"  # step pool unresolvable
+    QUOTE_FAILED_AT_STEP = "quote_failed_at_step"  # hop quote failed
+    NON_AUTHORITATIVE_QUOTE = "non_authoritative_quote"  # fallback quote rejected
+    BELOW_MIN_PROFIT = "below_min_profit"  # profitable but below min profit
+    BELOW_MIN_ROI = "below_min_roi"  # profitable but below min ROI
 
 
 @dataclass

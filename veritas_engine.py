@@ -37,19 +37,17 @@ from core.accounting import AccountingLedger, ExecutionRecord
 from core.rpc_health import RPCHealthMonitor
 from core.scan_result import ScanResult
 from core.opportunity_telemetry import Candidate, CandidateStatus, RejectionReason
+from core.route_valuation import (
+    evaluate_route_economics,
+    quote_full_route,
+    start_token_decimals,
+    validate_route_shape,
+)
 from core.error_taxonomy import ErrorTaxonomy, ErrorCode, ClassifiedError
 from core.capital_controller import CapitalController, CapitalMode
 from core.rpc import RPC
 from core.rpc_resilience import ResilientRPC, RPCCache
 from core.external_apis import AlchemyRPC, CryptoArbitrageAPI, DeFiLlamaAPI
-from core.mev_inspector import (
-    MEVType,
-    ArbitrageOpportunity,
-    LiquidationOpportunity,
-    SandwichOpportunity,
-    BlockProcessor,
-    MEVTracker,
-)
 from core.mev_inspector import (
     MEVType,
     ArbitrageOpportunity,
@@ -481,7 +479,17 @@ class VeritasEngine:
         """
         Evaluate a single route for profitability.
 
-        Returns a Candidate with full economic analysis, or None if invalid.
+        Canonical pipeline (shared with the forensic funnel):
+          validate_route_shape()
+            -> quote_full_route() hop-by-hop
+            -> per-hop provenance gate (authoritative quotes only)
+            -> same-asset final comparison
+            -> canonical EconomicModel.evaluate()
+            -> execution gate via is_worth_executing
+
+        Returns a Candidate with full economic analysis. Every rejection
+        carries an explicit reason; a profitable-but-below-threshold route
+        is NOT economically viable.
         """
         if not route.steps:
             return None
@@ -495,61 +503,107 @@ class VeritasEngine:
         )
 
         try:
-            # Get the first step's pool
-            first_step = route.steps[0]
-            pools = self.pool_registry.get_pools_for_pair_and_venue(
-                first_step.token_in, first_step.token_out, first_step.venue
-            )
-
-            if not pools:
-                candidate.reject(RejectionReason.NO_LIQUIDITY)
+            # 1. Route-shape validation (canonical invariant:
+            #    different-token amounts are never comparable).
+            shape_ok, _shape_reason = validate_route_shape(route)
+            if not shape_ok:
+                stats["quotes_failed"] = stats.get("quotes_failed", 0) + 1
+                candidate.reject(RejectionReason.MALFORMED_ROUTE)
                 return candidate
 
-            pool = pools[0]
-            if not pool.has_sufficient_liquidity():
-                candidate.reject(RejectionReason.NO_LIQUIDITY)
-                return candidate
-
-            # Get quote
+            # 2. Test size in native units of the start token. Decimals come
+            #    from first-hop pool metadata, never a hardcoded assumption.
             stats["quotes_attempted"] += 1
 
-            # Determine input amount (use a small test size)
             test_size_usd = 1.0
-            token_price = self.price_oracle.get_price_usd(first_step.token_in) or 2500.0
-            test_size_float = test_size_usd / token_price
-            amount_in = int(test_size_float * 10 ** 18)
+            first_pool = None
+            try:
+                first_pool = self.pool_registry.get_by_address(
+                    self.chain_id, route.steps[0].pool_address
+                )
+            except Exception:
+                first_pool = None
+            decimals = (
+                start_token_decimals(route, first_pool)
+                if first_pool is not None
+                else 18
+            )
+            token_price = (
+                self.price_oracle.get_price_usd(route.steps[0].token_in)
+                or 2500.0
+            )
+            amount_in = int(test_size_usd / token_price * (10 ** decimals))
 
-            quote = self.quote_engine.quote(
-                first_step.token_in, first_step.token_out, amount_in, pool
+            # 3. Full-path triangular quote: hop N out -> hop N+1 in.
+            final_out, hops, failure = quote_full_route(
+                route,
+                amount_in,
+                self.quote_engine,
+                self.pool_registry,
+                self.resilient_rpc,
+                self.chain_id,
             )
 
-            print(f"[DEBUG] Quote {first_step.token_in[:6]}->{first_step.token_out[:6]}: success={quote.success}, out={quote.amount_out}, error={quote.error}", flush=True)
-
-            if not quote.is_valid:
+            if failure is not None:
                 stats["quotes_failed"] += 1
-                candidate.reject(RejectionReason.NO_QUOTE)
+                if failure.startswith("non_authoritative_quote_at_step"):
+                    candidate.reject(RejectionReason.NON_AUTHORITATIVE_QUOTE)
+                elif failure.startswith("no_pool_for_step"):
+                    candidate.reject(RejectionReason.NO_POOL_FOR_STEP)
+                elif failure.startswith((
+                    "quote_failed_at_step",
+                    "no_liquidity_at_step",
+                )):
+                    candidate.reject(RejectionReason.QUOTE_FAILED_AT_STEP)
+                elif failure.startswith((
+                    "route_malformed",
+                    "chain_break",
+                )):
+                    candidate.reject(RejectionReason.MALFORMED_ROUTE)
+                else:
+                    candidate.reject(RejectionReason.NO_QUOTE)
                 return candidate
 
             stats["quotes_successful"] += 1
 
-            # Calculate economics
-            output_usd = test_size_usd  # Simplified — real impl uses output token price
-            gross_profit = output_usd - test_size_usd
-
-            if gross_profit > 0:
+            # 4. Same-asset round-trip economics via the canonical model.
+            #    final_out is denominated in the START token: the ONLY valid
+            #    comparison (A_final vs A_initial, never B vs A).
+            if final_out > amount_in:
                 stats["positive_gross_edges"] += 1
 
-            economic = self.economic_model.evaluate(
+            candidate.quote_source = ",".join(
+                str(h.get("source", "")) for h in hops
+            )
+            candidate.confidence = (
+                min(float(h.get("confidence", 0) or 0) for h in hops)
+                if hops
+                else 0.0
+            )
+            hop_blocks = [
+                int(h.get("block_number", 0) or 0) for h in hops
+            ]
+            candidate.block_number = (
+                max(hop_blocks) if hop_blocks else 0
+            )
+
+            economic = evaluate_route_economics(
+                amount_in_native=amount_in,
                 input_usd=test_size_usd,
-                gross_output_usd=output_usd,
-                flash_loan_amount_usd=test_size_usd,
-                estimated_gas_units=quote.gas_estimate if quote.gas_estimate > 0 else 350000,
+                final_out_native=final_out,
+                hops=hops,
+                economic_model=self.economic_model,
                 gas_price_gwei=0.01,
-                slippage_bps=int(quote.price_impact_bps),
+                block_number=candidate.block_number,
             )
 
             # Populate candidate
             candidate.input_amount = test_size_usd
+            candidate.output_amount = (
+                test_size_usd * (final_out / amount_in)
+                if amount_in > 0
+                else 0.0
+            )
             candidate.gross_profit_usd = economic.gross_profit_usd
             candidate.swap_fees_usd = economic.dex_fees_usd
             candidate.flash_loan_fee_usd = economic.flash_loan_fee_usd
@@ -557,11 +611,15 @@ class VeritasEngine:
             candidate.estimated_slippage_usd = economic.estimated_slippage_usd
             candidate.safety_margin_usd = economic.safety_margin_usd
             candidate.net_profit_usd = economic.expected_net_profit_usd
-            candidate.block_number = quote.block_number
-            candidate.confidence = quote.confidence
 
-            if economic.is_profitable:
+            if economic.is_worth_executing:
                 candidate.status = CandidateStatus.ECONOMICALLY_VIABLE
+            elif economic.is_profitable:
+                reason = (economic.below_threshold_reason or "").lower()
+                if "min_profit" in reason or "profit" in reason:
+                    candidate.reject(RejectionReason.BELOW_MIN_PROFIT)
+                else:
+                    candidate.reject(RejectionReason.BELOW_MIN_ROI)
             else:
                 candidate.reject(RejectionReason.FEE_REJECTION)
 
